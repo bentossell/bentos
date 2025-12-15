@@ -20,6 +20,7 @@ def parse_frontmatter(md_path: str) -> dict[str, Any]:
 		return {}
 	data: dict[str, Any] = {}
 	i = 1
+	current_list_key: str | None = None
 	while i < len(lines):
 		line = lines[i]
 		i += 1
@@ -27,11 +28,19 @@ def parse_frontmatter(md_path: str) -> dict[str, Any]:
 			break
 		if not line.strip() or line.lstrip().startswith('#'):
 			continue
+		if line.lstrip().startswith('- ') and current_list_key:
+			data.setdefault(current_list_key, []).append(line.strip()[2:])
+			continue
+		current_list_key = None
 		if ':' not in line:
 			continue
 		key, raw = line.split(':', 1)
 		key = key.strip()
 		raw = raw.strip()
+		if raw == '':
+			current_list_key = key
+			data[key] = []
+			continue
 		if raw.isdigit():
 			data[key] = int(raw)
 		else:
@@ -64,6 +73,46 @@ def parse_auth_status(output: str) -> list[dict[str, Any]]:
 	return accounts
 
 
+def gh_json(args: list[str]) -> Any:
+	proc = subprocess.run(['gh', *args], check=True, capture_output=True, text=True)
+	return json.loads(proc.stdout)
+
+
+GRAPHQL_SEARCH_PRS = """
+query($q: String!, $first: Int!) {
+  search(query: $q, type: ISSUE, first: $first) {
+    nodes {
+      __typename
+      ... on PullRequest {
+        title
+        url
+        updatedAt
+        state
+        number
+        repository { nameWithOwner }
+        author { login }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def graphql_search_prs(query: str, limit: int) -> list[dict[str, Any]]:
+	data = gh_json(['api', 'graphql', '-f', f'query={GRAPHQL_SEARCH_PRS}', '-f', f'q={query}', '-F', f'first={limit}'])
+	nodes = (((data or {}).get('data') or {}).get('search') or {}).get('nodes') or []
+	if not isinstance(nodes, list):
+		return []
+	out: list[dict[str, Any]] = []
+	for n in nodes:
+		if not isinstance(n, dict):
+			continue
+		if n.get('__typename') != 'PullRequest':
+			continue
+		out.append(n)
+	return out
+
+
 def main() -> int:
 	pos_dir = os.environ.get('POS_DIR')
 	if not pos_dir:
@@ -73,6 +122,11 @@ def main() -> int:
 	skill_md = os.path.join(pos_dir, 'skills', 'github', 'SKILL.md')
 	prefs = parse_frontmatter(skill_md)
 	max_notifications = int(prefs.get('max_notifications') or 50)
+	max_items = int(prefs.get('max_items') or 30)
+	tracked_repo_limit = int(prefs.get('tracked_repo_limit') or 10)
+	tracked_repos = prefs.get('tracked_repos') or []
+	if not isinstance(tracked_repos, list):
+		tracked_repos = []
 
 	emit({'type': 'progress', 'message': 'gh api user', 'pct': 0.1})
 	try:
@@ -161,49 +215,98 @@ def main() -> int:
 				},
 			)
 
-	prs: list[dict[str, Any]] = []
-	prs_error = None
-	emit({'type': 'progress', 'message': 'gh pr status', 'pct': 0.7})
-	try:
-		pr_proc = subprocess.run(
-			[
-				'gh',
-				'pr',
-				'status',
-				'--json',
-				'title,state,url,updatedAt',
-			],
-			check=True,
-			capture_output=True,
-			text=True,
-		)
-		pr_data = json.loads(pr_proc.stdout)
-		if isinstance(pr_data, dict):
-			for bucket in ('createdBy', 'needsReview'):
-				items = pr_data.get(bucket)
-				if not isinstance(items, list):
-					continue
-				for p in items:
+	items: list[dict[str, Any]] = []
+	items_errors: dict[str, Any] = {}
+	logins = [a.get('login') for a in accounts if isinstance(a, dict) and isinstance(a.get('login'), str)]
+	logins = [l for l in logins if l]
+	emit({'type': 'progress', 'message': 'gh api graphql (recent PRs)', 'pct': 0.7})
+	for idx, login in enumerate(logins):
+		try:
+			nodes = graphql_search_prs(f'is:pr author:{login} sort:updated-desc', min(max_items, 50))
+			for n in nodes:
+				repo = ((n.get('repository') or {}) if isinstance(n.get('repository'), dict) else {})
+				repo_name = repo.get('nameWithOwner') or ''
+				num = n.get('number') or 0
+				items.append(
+					{
+						'kind': 'pr',
+						'title': n.get('title') or '',
+						'url': n.get('url') or '',
+						'repo': repo_name,
+						'number': num,
+						'state': n.get('state') or '',
+						'updatedAt': n.get('updatedAt') or '',
+						'account': login,
+						'source': 'authored',
+					},
+				)
+		except subprocess.CalledProcessError as e:
+			items_errors[f'prs:{login}'] = (e.stderr or '').strip() or f'gh api graphql failed (code={e.returncode})'
+		except Exception as e:
+			items_errors[f'prs:{login}'] = str(e)
+		pct = 0.7 + 0.1 * ((idx + 1) / max(len(logins), 1))
+		emit({'type': 'progress', 'message': f'recent PRs: {login}', 'pct': pct})
+
+	if tracked_repos:
+		emit({'type': 'progress', 'message': 'gh repo items (tracked repos)', 'pct': 0.82})
+	for repo in tracked_repos:
+		if not isinstance(repo, str) or not repo:
+			continue
+		try:
+			prs = gh_json(['pr', 'list', '-R', repo, '--limit', str(tracked_repo_limit), '--json', 'title,url,number,state,updatedAt,author'])
+			if isinstance(prs, list):
+				for p in prs:
 					if not isinstance(p, dict):
 						continue
-					title = p.get('title') or ''
-					state = p.get('state') or ''
-					url = p.get('url') or ''
-					updated_at = p.get('updatedAt') or ''
-					prs.append(
+					items.append(
 						{
-							'title': title,
-							'state': state,
-							'url': url,
-							'updatedAt': updated_at,
-							'date': updated_at,
-							'category': bucket,
+							'kind': 'pr',
+							'title': p.get('title') or '',
+							'url': p.get('url') or '',
+							'repo': repo,
+							'number': p.get('number') or 0,
+							'state': p.get('state') or '',
+							'updatedAt': p.get('updatedAt') or '',
+							'account': '',
+							'source': 'tracked',
 						},
 					)
-	except subprocess.CalledProcessError as e:
-		prs_error = (e.stderr or '').strip() or f'gh pr status failed (code={e.returncode})'
-	except Exception as e:
-		prs_error = str(e)
+			issues = gh_json(['issue', 'list', '-R', repo, '--limit', str(tracked_repo_limit), '--json', 'title,url,number,state,updatedAt,author'])
+			if isinstance(issues, list):
+				for it in issues:
+					if not isinstance(it, dict):
+						continue
+					items.append(
+						{
+							'kind': 'issue',
+							'title': it.get('title') or '',
+							'url': it.get('url') or '',
+							'repo': repo,
+							'number': it.get('number') or 0,
+							'state': it.get('state') or '',
+							'updatedAt': it.get('updatedAt') or '',
+							'account': '',
+							'source': 'tracked',
+						},
+					)
+		except subprocess.CalledProcessError as e:
+			items_errors[f'tracked:{repo}'] = (e.stderr or '').strip() or f'gh list failed (code={e.returncode})'
+		except Exception as e:
+			items_errors[f'tracked:{repo}'] = str(e)
+
+	# De-dupe + sort.
+	seen_urls: set[str] = set()
+	unique: list[dict[str, Any]] = []
+	for it in items:
+		url = it.get('url') or ''
+		if not isinstance(url, str) or not url:
+			continue
+		if url in seen_urls:
+			continue
+		seen_urls.add(url)
+		unique.append(it)
+	unique.sort(key=lambda x: str(x.get('updatedAt') or ''), reverse=True)
+	items = unique[:max_items]
 
 	last_sync = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 	state = {
@@ -212,12 +315,12 @@ def main() -> int:
 		'accounts': accounts,
 		'notifications': notifications,
 		'notifications_error': notifications_error,
-		'prs': prs,
-		'prs_error': prs_error,
+		'items': items,
+		'items_error': items_errors or None,
 		'stats': {
 			'notifications_count': len(notifications),
 			'notifications_unread': sum(1 for n in notifications if n.get('unread')),
-			'prs_count': len(prs),
+			'items_count': len(items),
 			'accounts_count': len(accounts),
 		},
 	}

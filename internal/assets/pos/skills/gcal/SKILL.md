@@ -7,6 +7,8 @@ accounts:
   - ben@factory.ai
 calendar_id: primary
 max_events: 50
+days_back: 1
+days_ahead: 14
 ---
 
 # Google Calendar

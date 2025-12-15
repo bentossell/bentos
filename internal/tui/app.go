@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,6 +63,13 @@ type Model struct {
 
 	gcalAccounts   []string
 	gcalAccountIdx int
+	gcalCalendarID string
+
+	githubAccounts         []string
+	githubAccountIdx       int
+	githubFilterIdx        int
+	githubNotificationsErr string
+	githubItemsErr         string
 
 	actionOptions []actionOption
 	actionCursor  int
@@ -521,6 +529,13 @@ func (m Model) renderHelp() string {
 		"",
 		"Linear tips:",
 		"  f               cycle status filters (Focus/All/Done/Canceled)",
+		"",
+		"Calendar tips:",
+		"  '[' / ']' or '/' cycle account filter (All / per-account)",
+		"",
+		"GitHub tips:",
+		"  '[' / ']' or '/' cycle account filter (All / per-account)",
+		"  f               cycle view filters (All/PRs/Issues/Tracked)",
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(strings.Join(lines, "\n"))
 }
@@ -574,7 +589,7 @@ func (m *Model) loadListItems(surface string) ([]listItem, error) {
 			return nil, err
 		}
 		obj, _ := v.(map[string]any)
-		return listItemsFromGithub(obj), nil
+		return m.listItemsFromGithub(obj), nil
 	default:
 		return nil, fmt.Errorf("unknown surface: %s", surface)
 	}
@@ -687,6 +702,9 @@ func (m *Model) listItemsFromGcal(obj map[string]any) []listItem {
 	if obj == nil {
 		return nil
 	}
+	if calID, ok := obj["calendar_id"].(string); ok {
+		m.gcalCalendarID = calID
+	}
 	accounts := deriveStringList(obj["accounts"])
 	m.gcalAccounts = append([]string{"All"}, accounts...)
 	if m.gcalAccountIdx < 0 || m.gcalAccountIdx >= len(m.gcalAccounts) {
@@ -710,16 +728,21 @@ func (m *Model) listItemsFromGcal(obj map[string]any) []listItem {
 		}
 		summary, _ := it["summary"].(string)
 		start, _ := it["start"].(string)
-		age := humanAgeFromISO(start)
-		meta := age
+		when := formatEventWhen(start)
+		delta := humanDeltaFromISO(start)
+		meta := strings.TrimSpace(strings.Trim(strings.Join([]string{acct, delta}, " · "), " ·"))
 		if acct != "" {
-			meta = acct + " · " + age
+			// keep acct in meta
 		}
 		key := id
 		if acct != "" {
 			key = acct + ":" + id
 		}
-		out = append(out, listItem{Key: key, Title: summary, Subtitle: start, Meta: meta, Raw: it})
+		sub := when
+		if sub == "" {
+			sub = start
+		}
+		out = append(out, listItem{Key: key, Title: summary, Subtitle: sub, Meta: meta, Raw: it})
 	}
 	return out
 }
@@ -730,6 +753,14 @@ func (m *Model) linearFilterName() string {
 		m.linearFilterIdx = 0
 	}
 	return filters[m.linearFilterIdx]
+}
+
+func (m *Model) githubFilterName() string {
+	filters := []string{"All", "PRs", "Issues", "Tracked"}
+	if m.githubFilterIdx < 0 || m.githubFilterIdx >= len(filters) {
+		m.githubFilterIdx = 0
+	}
+	return filters[m.githubFilterIdx]
 }
 
 func linearStatusMatchesFilter(status string, filter string) bool {
@@ -757,43 +788,80 @@ func listItemsFromGcal(obj map[string]any) []listItem {
 	return nil
 }
 
-func listItemsFromGithub(obj map[string]any) []listItem {
+func (m *Model) listItemsFromGithub(obj map[string]any) []listItem {
 	if obj == nil {
 		return nil
 	}
-	prs := deriveMapList(obj["prs"])
-	if len(prs) > 0 {
-		var out []listItem
-		for _, it := range prs {
-			title, _ := it["title"].(string)
-			url, _ := it["url"].(string)
-			state, _ := it["state"].(string)
-			category, _ := it["category"].(string)
-			updated, _ := it["updatedAt"].(string)
-			key := url
-			if key == "" {
-				key = title
-			}
-			meta := strings.Trim(strings.Join([]string{category, state, humanAgeFromISO(updated)}, " · "), " ·")
-			out = append(out, listItem{Key: key, Title: title, Subtitle: meta, Meta: url, Raw: it})
-		}
-		return out
+	m.githubNotificationsErr, _ = obj["notifications_error"].(string)
+	if itemsErr, ok := obj["items_error"].(map[string]any); ok {
+		m.githubItemsErr = prettyJSON(itemsErr)
+	} else {
+		m.githubItemsErr = ""
 	}
 
 	accounts := deriveMapList(obj["accounts"])
-	var out []listItem
+	var logins []string
 	for _, it := range accounts {
 		login, _ := it["login"].(string)
-		if login == "" {
+		if login != "" {
+			logins = append(logins, login)
+		}
+	}
+	m.githubAccounts = append([]string{"All"}, logins...)
+	if m.githubAccountIdx < 0 || m.githubAccountIdx >= len(m.githubAccounts) {
+		m.githubAccountIdx = 0
+	}
+	accountFilter := ""
+	if m.githubAccountIdx > 0 && m.githubAccountIdx < len(m.githubAccounts) {
+		accountFilter = m.githubAccounts[m.githubAccountIdx]
+	}
+	filter := m.githubFilterName()
+
+	items := deriveMapList(obj["items"])
+	if len(items) == 0 {
+		return nil
+	}
+
+	var out []listItem
+	for _, it := range items {
+		kind, _ := it["kind"].(string)
+		source, _ := it["source"].(string)
+		acct, _ := it["account"].(string)
+		if accountFilter != "" && acct != accountFilter && source != "tracked" {
 			continue
 		}
-		active, _ := it["active"].(bool)
-		scopes, _ := it["scopes"].(string)
-		meta := scopes
-		if active {
-			meta = "active · " + scopes
+		switch filter {
+		case "PRs":
+			if kind != "pr" {
+				continue
+			}
+		case "Issues":
+			if kind != "issue" {
+				continue
+			}
+		case "Tracked":
+			if source != "tracked" {
+				continue
+			}
 		}
-		out = append(out, listItem{Key: login, Title: login, Subtitle: meta, Meta: "", Raw: it})
+
+		repo, _ := it["repo"].(string)
+		num := intFromAny(it["number"])
+		title, _ := it["title"].(string)
+		shown := title
+		if repo != "" && num > 0 {
+			shown = fmt.Sprintf("%s#%d — %s", repo, num, title)
+		}
+		state, _ := it["state"].(string)
+		updated, _ := it["updatedAt"].(string)
+		age := humanAgeFromISO(updated)
+		meta := strings.Trim(strings.Join([]string{source, strings.ToLower(state), age}, " · "), " ·")
+		url, _ := it["url"].(string)
+		key := url
+		if key == "" {
+			key = fmt.Sprintf("%s#%d", repo, num)
+		}
+		out = append(out, listItem{Key: key, Title: shown, Subtitle: meta, Meta: url, Raw: it})
 	}
 	return out
 }
@@ -824,14 +892,42 @@ func (m Model) renderList() string {
 		if m.gcalAccountIdx > 0 && m.gcalAccountIdx < len(m.gcalAccounts) {
 			acct = m.gcalAccounts[m.gcalAccountIdx]
 		}
-		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Account: " + acct + ")"))
+		calID := m.gcalCalendarID
+		if calID == "" {
+			calID = "primary"
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Account: " + acct + " · Cal: " + calID + ")"))
+	}
+	if surface == "github" {
+		acct := "All"
+		if m.githubAccountIdx > 0 && m.githubAccountIdx < len(m.githubAccounts) {
+			acct = m.githubAccounts[m.githubAccountIdx]
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Account: " + acct + " · View: " + m.githubFilterName() + ")"))
 	}
 	b.WriteString("\n")
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(fmt.Sprintf("Selected: %d", m.selectedCount())))
 	b.WriteString("\n\n")
 
 	if len(m.listItems) == 0 {
-		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("(empty)"))
+		empty := "(empty)"
+		if surface == "gcal" {
+			calID := m.gcalCalendarID
+			if calID == "" {
+				calID = "primary"
+			}
+			empty = "No calendar events. Try :gcal sync (or increase days_ahead in skills/gcal/SKILL.md).\nCalendar: " + calID
+		}
+		if surface == "github" {
+			empty = "No GitHub items. Try :github sync.\nTo track issues/PRs in specific repos, add tracked_repos in skills/github/SKILL.md."
+			if m.githubNotificationsErr != "" {
+				empty += "\n\nNotifications: " + truncate(m.githubNotificationsErr, 120)
+			}
+			if m.githubItemsErr != "" {
+				empty += "\n\nItems error: " + truncate(strings.ReplaceAll(m.githubItemsErr, "\n", " "), 160)
+			}
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(empty))
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -891,6 +987,9 @@ func (m Model) renderList() string {
 	}
 	if surface == "linear" {
 		footer = "Space select · Enter detail · f filter · : commands · ? help"
+	}
+	if surface == "github" {
+		footer = "Enter detail · f filter · [ ] or / account · : commands · ? help"
 	}
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footer))
 	b.WriteString("\n")
@@ -977,6 +1076,12 @@ func (m Model) renderDetail() string {
 		if surface == "gmail" {
 			text = stripGmailThreadHeaders(text)
 		}
+		if surface == "github" || surface == "gcal" {
+			var v any
+			if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &v); err == nil {
+				text = prettyJSON(v)
+			}
+		}
 		if m.width > 0 {
 			w := m.width - 2
 			if w < 20 {
@@ -1051,6 +1156,11 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 			m.reloadListFromState()
 			m.ensureCursorVisible()
 		}
+		if surface == "github" {
+			m.githubFilterIdx = (m.githubFilterIdx + 1) % 4
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+		}
 		return nil
 	case "[":
 		if surface == "gmail" && len(m.gmailAccounts) > 0 {
@@ -1069,6 +1179,14 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 			m.reloadListFromState()
 			m.ensureCursorVisible()
 		}
+		if surface == "github" && len(m.githubAccounts) > 0 {
+			m.githubAccountIdx--
+			if m.githubAccountIdx < 0 {
+				m.githubAccountIdx = len(m.githubAccounts) - 1
+			}
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+		}
 		return nil
 	case "]":
 		if surface == "gmail" && len(m.gmailAccounts) > 0 {
@@ -1078,6 +1196,11 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 		}
 		if surface == "gcal" && len(m.gcalAccounts) > 0 {
 			m.gcalAccountIdx = (m.gcalAccountIdx + 1) % len(m.gcalAccounts)
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+		}
+		if surface == "github" && len(m.githubAccounts) > 0 {
+			m.githubAccountIdx = (m.githubAccountIdx + 1) % len(m.githubAccounts)
 			m.reloadListFromState()
 			m.ensureCursorVisible()
 		}
@@ -1092,6 +1215,12 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 		}
 		if surface == "gcal" && len(m.gcalAccounts) > 0 {
 			m.gcalAccountIdx = (m.gcalAccountIdx + 1) % len(m.gcalAccounts)
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+			return nil
+		}
+		if surface == "github" && len(m.githubAccounts) > 0 {
+			m.githubAccountIdx = (m.githubAccountIdx + 1) % len(m.githubAccounts)
 			m.reloadListFromState()
 			m.ensureCursorVisible()
 			return nil
@@ -1242,6 +1371,32 @@ func (m *Model) fetchDetailForItem(surface string, it listItem) tea.Cmd {
 		}
 		m.detailLoading = true
 		return fetchLinearIssueCmd(filepath.Join(m.posDir, "skills", "linear", "vendor", "issues.js"), identifier)
+	case "gcal":
+		eventID, _ := it.Raw["id"].(string)
+		acct, _ := it.Raw["account"].(string)
+		calID, _ := it.Raw["calendar_id"].(string)
+		if calID == "" {
+			calID = m.gcalCalendarID
+		}
+		if calID == "" {
+			calID = "primary"
+		}
+		if eventID == "" || acct == "" {
+			m.detailText = prettyJSON(it.Raw)
+			return nil
+		}
+		m.detailLoading = true
+		return fetchGcalEventCmd(acct, calID, eventID)
+	case "github":
+		kind, _ := it.Raw["kind"].(string)
+		repo, _ := it.Raw["repo"].(string)
+		num := intFromAny(it.Raw["number"])
+		if kind == "" || repo == "" || num <= 0 {
+			m.detailText = prettyJSON(it.Raw)
+			return nil
+		}
+		m.detailLoading = true
+		return fetchGithubDetailCmd(kind, repo, num)
 	default:
 		m.detailText = prettyJSON(it.Raw)
 		return nil
@@ -1266,6 +1421,37 @@ func fetchLinearIssueCmd(issuesScriptPath string, identifier string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "node", issuesScriptPath, "--id", identifier)
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() != nil && err == nil {
+			err = ctx.Err()
+		}
+		return detailLoadedMsg{text: string(out), err: err}
+	}
+}
+
+func fetchGcalEventCmd(account string, calendarID string, eventID string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "gccli", account, "event", calendarID, eventID)
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() != nil && err == nil {
+			err = ctx.Err()
+		}
+		return detailLoadedMsg{text: string(out), err: err}
+	}
+}
+
+func fetchGithubDetailCmd(kind string, repo string, number int) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		var cmd *exec.Cmd
+		if kind == "issue" {
+			cmd = exec.CommandContext(ctx, "gh", "issue", "view", fmt.Sprintf("%d", number), "-R", repo, "--json", "title,body,state,url,author,updatedAt")
+		} else {
+			cmd = exec.CommandContext(ctx, "gh", "pr", "view", fmt.Sprintf("%d", number), "-R", repo, "--json", "title,body,state,url,author,updatedAt")
+		}
 		out, err := cmd.CombinedOutput()
 		if ctx.Err() != nil && err == nil {
 			err = ctx.Err()
@@ -1331,6 +1517,22 @@ func deriveStringList(v any) []string {
 	return out
 }
 
+func intFromAny(v any) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case int64:
+		return int(t)
+	case float64:
+		return int(t)
+	case string:
+		n, _ := strconv.Atoi(t)
+		return n
+	default:
+		return 0
+	}
+}
+
 func humanAgeFromISO(s string) string {
 	if s == "" {
 		return "-"
@@ -1342,6 +1544,63 @@ func humanAgeFromISO(s string) string {
 		return humanAge(time.Since(t))
 	}
 	return "-"
+}
+
+func parseISOOrDate(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse("2006-01-02T15:04:05", s); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
+}
+
+func humanDeltaFromISO(s string) string {
+	t, ok := parseISOOrDate(s)
+	if !ok {
+		return "-"
+	}
+	d := time.Until(t)
+	if d < 0 {
+		return humanAge(-d) + " ago"
+	}
+	return "in " + humanAge(d)
+}
+
+func formatEventWhen(s string) string {
+	t, ok := parseISOOrDate(s)
+	if !ok {
+		return ""
+	}
+	local := t.In(time.Local)
+	now := time.Now().In(time.Local)
+	// Heuristic: date-only strings are all-day.
+	if len(s) == 10 {
+		return local.Format("Mon 02 Jan") + " (all-day)"
+	}
+	if sameDay(now, local) {
+		return "Today " + local.Format("15:04")
+	}
+	if sameDay(now.Add(24*time.Hour), local) {
+		return "Tomorrow " + local.Format("15:04")
+	}
+	return local.Format("Mon 02 Jan 15:04")
+}
+
+func sameDay(a, b time.Time) bool {
+	ay, ad := a.Year(), a.YearDay()
+	by, bd := b.Year(), b.YearDay()
+	return ay == by && ad == bd
 }
 
 func prettyJSON(v any) string {

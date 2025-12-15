@@ -60,6 +60,116 @@ def try_parse_json(text: str) -> Any | None:
 		return None
 
 
+def extract_json(text: str) -> Any | None:
+	text = text.strip()
+	if not text:
+		return None
+	decoder = json.JSONDecoder()
+	for i, ch in enumerate(text):
+		if ch not in '[{':
+			continue
+		try:
+			obj, _end = decoder.raw_decode(text[i:])
+			return obj
+		except Exception:
+			continue
+	return None
+
+
+def pick_dt(v: Any) -> str:
+	if isinstance(v, dict):
+		return str(v.get('dateTime') or v.get('date') or '')
+	if v is None:
+		return ''
+	return str(v)
+
+
+def normalize_event(raw: dict[str, Any], account: str, calendar_id: str) -> dict[str, Any] | None:
+	eid = str(raw.get('id') or raw.get('eventId') or '')
+	if not eid:
+		return None
+	summary = raw.get('summary') or raw.get('title') or ''
+	start = pick_dt(raw.get('start') or raw.get('startTime'))
+	end = pick_dt(raw.get('end') or raw.get('endTime'))
+	out: dict[str, Any] = {
+		'id': eid,
+		'summary': summary,
+		'start': start,
+		'end': end,
+		'account': account,
+		'calendar_id': calendar_id,
+	}
+	for k in ('location', 'description', 'htmlLink'):
+		if k in raw and raw.get(k) is not None:
+			out[k] = raw.get(k)
+	att = raw.get('attendees')
+	if isinstance(att, list):
+		emails: list[str] = []
+		for a in att:
+			if isinstance(a, dict):
+				email = a.get('email')
+				if isinstance(email, str) and email:
+					emails.append(email)
+			elif isinstance(a, str) and a:
+				emails.append(a)
+		if emails:
+			out['attendees'] = emails
+	return out
+
+
+def parse_events(parsed: Any, account: str, calendar_id: str) -> list[dict[str, Any]]:
+	items: list[dict[str, Any]] = []
+	if isinstance(parsed, list):
+		for e in parsed:
+			if not isinstance(e, dict):
+				continue
+			n = normalize_event(e, account, calendar_id)
+			if n:
+				items.append(n)
+		return items
+	if isinstance(parsed, dict):
+		arr = parsed.get('events') or parsed.get('items') or []
+		if isinstance(arr, list):
+			for e in arr:
+				if not isinstance(e, dict):
+					continue
+				n = normalize_event(e, account, calendar_id)
+				if n:
+					items.append(n)
+		return items
+	return items
+
+
+def parse_tsv_events(text: str, account: str, calendar_id: str) -> list[dict[str, Any]]:
+	text = (text or '').strip()
+	if not text:
+		return []
+	if text.strip().lower() == 'no events':
+		return []
+	lines = [l for l in text.splitlines() if l.strip()]
+	if not lines:
+		return []
+	header = lines[0].strip()
+	if not header.upper().startswith('ID\tSTART\tEND\tSUMMARY'):
+		return []
+	out: list[dict[str, Any]] = []
+	for line in lines[1:]:
+		cols = line.split('\t')
+		if len(cols) < 4:
+			continue
+		eid = cols[0].strip()
+		if not eid:
+			continue
+		start = cols[1].strip()
+		end = cols[2].strip()
+		summary = '\t'.join(cols[3:]).strip()
+		raw = {'id': eid, 'summary': summary, 'start': start, 'end': end}
+		n = normalize_event(raw, account, calendar_id)
+		if n:
+			out.append(n)
+	return out
+
+
 def main() -> int:
 	pos_dir = os.environ.get('POS_DIR')
 	if not pos_dir:
@@ -71,6 +181,8 @@ def main() -> int:
 	accounts = prefs.get('accounts') or []
 	calendar_id = prefs.get('calendar_id') or 'primary'
 	max_events = int(prefs.get('max_events') or 50)
+	days_back = int(prefs.get('days_back') or 1)
+	days_ahead = int(prefs.get('days_ahead') or 14)
 	if not isinstance(accounts, list):
 		accounts = []
 	if not accounts:
@@ -82,13 +194,15 @@ def main() -> int:
 		return 1
 
 	now = datetime.now(timezone.utc)
-	start = now
-	end = now + timedelta(days=7)
+	start = now - timedelta(days=days_back)
+	end = now + timedelta(days=days_ahead)
 	start_s = start.isoformat().replace('+00:00', 'Z')
 	end_s = end.isoformat().replace('+00:00', 'Z')
 
 	all_events: list[dict[str, Any]] = []
 	per_account: dict[str, int] = {}
+	per_account_debug: dict[str, Any] = {}
+	per_account_errors: dict[str, Any] = {}
 	for idx, account in enumerate(accounts):
 		if not isinstance(account, str) or not account:
 			continue
@@ -117,60 +231,43 @@ def main() -> int:
 			emit({'type': 'error', 'message': 'gccli not found in PATH'})
 			return 1
 		except subprocess.CalledProcessError as e:
-			emit(
-				{
-					'type': 'error',
-					'message': 'gccli events failed',
-					'details': {
-						'account': account,
-						'code': e.returncode,
-						'stderr': (e.stderr or '').strip(),
-					},
-				},
-			)
-			return 1
+			per_account_errors[account] = {
+				'code': e.returncode,
+				'stderr': (e.stderr or '').strip(),
+			}
+			continue
 
-		parsed = try_parse_json(proc.stdout)
-		events: list[dict[str, Any]] = []
-		if isinstance(parsed, list):
-			for e in parsed:
-				if not isinstance(e, dict):
-					continue
-				events.append(
-					{
-						'id': str(e.get('id') or e.get('eventId') or ''),
-						'summary': e.get('summary') or e.get('title') or '',
-						'start': e.get('start') or e.get('startTime') or '',
-						'end': e.get('end') or e.get('endTime') or '',
-						'account': account,
-					},
-				)
-		elif isinstance(parsed, dict):
-			items = parsed.get('events') or parsed.get('items') or []
-			if isinstance(items, list):
-				for e in items:
-					if not isinstance(e, dict):
-						continue
-					events.append(
-						{
-							'id': str(e.get('id') or ''),
-							'summary': e.get('summary') or '',
-							'start': (e.get('start') or {}).get('dateTime') if isinstance(e.get('start'), dict) else e.get('start'),
-							'end': (e.get('end') or {}).get('dateTime') if isinstance(e.get('end'), dict) else e.get('end'),
-							'account': account,
-						},
-					)
-
+		raw_out = (proc.stdout or '').strip()
+		parsed = extract_json(raw_out) or try_parse_json(raw_out)
+		events = parse_events(parsed, account, str(calendar_id))
+		if parsed is None and not events:
+			events = parse_tsv_events(raw_out, account, str(calendar_id))
+		if parsed is None and not events:
+			per_account_debug[account] = {
+				'parse_error': True,
+				'stdout_head': raw_out[:2000],
+				'stderr_head': (proc.stderr or '').strip()[:2000],
+			}
 		all_events.extend(events)
 		per_account[account] = len(events)
+
+	# Sort by start time where possible.
+	def start_key(e: dict[str, Any]) -> str:
+		return str(e.get('start') or '')
+
+	all_events.sort(key=start_key)
 
 	last_sync = now.isoformat().replace('+00:00', 'Z')
 	state = {
 		'last_sync': last_sync,
 		'accounts': accounts,
+		'calendar_id': calendar_id,
+		'range': {'from': start_s, 'to': end_s, 'days_back': days_back, 'days_ahead': days_ahead},
 		'events': all_events,
 		'stats': {'count': len(all_events), 'per_account_count': per_account},
-		'raw': None if all_events else 'No events',
+		'errors': per_account_errors or None,
+		'debug': per_account_debug or None,
+		'raw': None,
 	}
 
 	os.makedirs(os.path.join(pos_dir, 'STATE'), exist_ok=True)
@@ -180,7 +277,7 @@ def main() -> int:
 		f.write('\n')
 
 	emit({'type': 'artifact', 'path': 'STATE/gcal.json', 'description': 'Updated calendar index state'})
-	emit({'type': 'result', 'ok': True, 'data': {'events': len(all_events), 'accounts': accounts}})
+	emit({'type': 'result', 'ok': True, 'data': {'events': len(all_events), 'accounts': accounts, 'calendar_id': calendar_id}})
 	return 0
 
 
