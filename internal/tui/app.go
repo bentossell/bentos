@@ -6,17 +6,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"gopkg.in/yaml.v3"
 
 	"github.com/bentossell/bentos/internal/config"
 	"github.com/bentossell/bentos/internal/events"
@@ -42,6 +47,7 @@ type Model struct {
 
 	homeCfg  config.HomeConfig
 	homeBody string
+	homeVP   viewport.Model
 
 	cmdInput textinput.Model
 	cmdMode  bool
@@ -64,12 +70,19 @@ type Model struct {
 	gcalAccounts   []string
 	gcalAccountIdx int
 	gcalCalendarID string
+	gcalView       string
+	gcalAnchor     time.Time
+	gcalDayIdx     int
+	gcalEventIdx   int
+	gcalOffset     int
 
 	githubAccounts         []string
 	githubAccountIdx       int
 	githubFilterIdx        int
 	githubNotificationsErr string
 	githubItemsErr         string
+	githubTrackedRepos     []string
+	githubTrackedLocal     []string
 
 	actionOptions []actionOption
 	actionCursor  int
@@ -78,6 +91,7 @@ type Model struct {
 	detailSurface string
 	detailText    string
 	detailLoading bool
+	detailVP      viewport.Model
 
 	runLines []string
 	maxLines int
@@ -94,6 +108,10 @@ type Model struct {
 	errCh    chan error
 	lastErr  string
 	lastInfo string
+
+	pendingOpenSurface  string
+	pendingOpenSummary  string
+	pendingOpenEntities []events.EventEntity
 
 	eventsWriter events.Writer
 }
@@ -129,6 +147,11 @@ type detailLoadedMsg struct {
 	err  error
 }
 
+type openURLMsg struct {
+	url string
+	err error
+}
+
 func New(posDir string) (Model, error) {
 	homePath := filepath.Join(posDir, "HOME.md")
 	hc, hb, err := config.ReadHomeConfig(homePath)
@@ -146,6 +169,7 @@ func New(posDir string) (Model, error) {
 		posDir:          posDir,
 		homeCfg:         hc,
 		homeBody:        hb,
+		homeVP:          viewport.New(0, 0),
 		cmdInput:        ti,
 		maxLines:        200,
 		eventsWriter:    events.Writer{Dir: filepath.Join(posDir, "EVENTS")},
@@ -158,6 +182,9 @@ func New(posDir string) (Model, error) {
 		listCursor:      0,
 		listOffset:      0,
 		listSelected:    map[string]bool{},
+		gcalView:        "week",
+		gcalAnchor:      time.Now(),
+		detailVP:        viewport.New(0, 0),
 	}, nil
 }
 
@@ -170,6 +197,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.resizeDetailViewport()
+		m.resizeHomeViewport()
+		if m.activeSurface() == "home" && m.mode == modeHome {
+			m.refreshHomeViewport(false)
+		}
 		return m, nil
 	case tea.MouseMsg:
 		if m.mode == modeList {
@@ -178,6 +210,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.updateListKeys(tea.KeyMsg{Type: tea.KeyUp})
 			case tea.MouseWheelDown:
 				return m, m.updateListKeys(tea.KeyMsg{Type: tea.KeyDown})
+			}
+		}
+		if m.mode == modeDetail {
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				return m, m.updateDetailKeys(tea.KeyMsg{Type: tea.KeyUp})
+			case tea.MouseWheelDown:
+				return m, m.updateDetailKeys(tea.KeyMsg{Type: tea.KeyDown})
 			}
 		}
 		return m, nil
@@ -189,6 +229,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cmdMode = true
 			m.cmdInput.SetValue("")
 			m.cmdInput.Focus()
+			m.resizeDetailViewport()
 			return m, nil
 		case msg.String() == "?":
 			if m.mode == modeHelp {
@@ -200,6 +241,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case msg.String() == "esc":
 			m.cmdMode = false
 			m.cmdInput.Blur()
+			m.resizeDetailViewport()
 			if m.proposalsActive {
 				m.proposalsActive = false
 				m.proposals = nil
@@ -216,6 +258,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.detailItem = nil
 				m.detailText = ""
 				m.detailLoading = false
+				m.detailVP.SetContent("")
 				return m, nil
 			}
 			if m.mode == modeActionPicker {
@@ -240,6 +283,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				line := strings.TrimSpace(m.cmdInput.Value())
 				m.cmdMode = false
 				m.cmdInput.Blur()
+				m.resizeDetailViewport()
 				if line != "" {
 					return m, m.execCommand(line)
 				}
@@ -282,10 +326,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.mode {
 		case modeHelp:
 			return m, nil
+		case modeHome:
+			return m, m.updateHomeKeys(msg)
 		case modeList:
 			return m, m.updateListKeys(msg)
 		case modeDetail:
-			return m, nil
+			return m, m.updateDetailKeys(msg)
 		case modeActionPicker:
 			return m, m.updateActionPickerKeys(msg)
 		}
@@ -346,9 +392,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
 			m.detailText = ""
+			m.refreshDetailViewport(true)
 			return m, nil
 		}
 		m.detailText = msg.text
+		m.refreshDetailViewport(true)
+		return m, nil
+	case openURLMsg:
+		if msg.err != nil {
+			m.lastErr = msg.err.Error()
+			return m, nil
+		}
+		if msg.url != "" {
+			m.lastInfo = "opened: " + msg.url
+			_ = m.eventsWriter.Append(events.Event{
+				Kind:     "open",
+				Surface:  firstNonEmpty(m.pendingOpenSurface, m.activeSurface()),
+				Name:     firstNonEmpty(m.pendingOpenSurface, m.activeSurface()) + ".open",
+				Op:       "open",
+				Actor:    "user",
+				Entities: m.pendingOpenEntities,
+				Summary:  firstNonEmpty(m.pendingOpenSummary, msg.url),
+				Data:     map[string]any{"url": msg.url},
+			})
+			m.pendingOpenSurface = ""
+			m.pendingOpenSummary = ""
+			m.pendingOpenEntities = nil
+		}
 		return m, nil
 	}
 
@@ -419,12 +489,12 @@ func (m Model) View() string {
 		b.WriteString("\n\n")
 	}
 
+	b.WriteString(m.renderDivider())
+	b.WriteString("\n")
+
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Run"))
 	b.WriteString("\n")
-	runN := 12
-	if m.height > 0 {
-		runN = max(6, m.height/4)
-	}
+	runN := m.runPanelLines()
 	start := 0
 	if len(m.runLines) > runN {
 		start = len(m.runLines) - runN
@@ -476,17 +546,22 @@ func (m *Model) resetSurfaceState() {
 	m.listCursor = 0
 	m.listOffset = 0
 	m.listSelected = map[string]bool{}
+	m.homeVP.SetContent("")
 	m.actionOptions = nil
 	m.actionCursor = 0
 	m.detailItem = nil
 	m.detailSurface = ""
 	m.detailText = ""
 	m.detailLoading = false
+	m.detailVP.SetContent("")
 	m.proposalsActive = false
 	m.proposals = nil
 	m.proposalCursor = 0
 	m.proposalsSurface = ""
 	m.reloadListFromState()
+	if m.activeSurface() == "home" {
+		m.refreshHomeViewport(true)
+	}
 }
 
 func (m Model) renderTabs() string {
@@ -512,14 +587,22 @@ func (m Model) renderHelp() string {
 		"  q               quit",
 		"  ?               toggle help",
 		"",
+		"Home:",
+		"  j/k or ↑/↓      scroll",
+		"",
 		"List view:",
 		"  j/k or ↑/↓      move cursor",
 		"  Enter           open detail",
+		"  o               open selected in browser",
 		"  Space or x      toggle selection for current row",
 		"  X               select all visible",
 		"  u               unselect all",
 		"  a               actions for selected (where supported)",
 		"  Esc             back",
+		"",
+		"Detail view:",
+		"  j/k or ↑/↓      scroll",
+		"  o               open in browser",
 		"",
 		"Commands:",
 		"  :               command palette (e.g. 'gmail sync', 'linear sync')",
@@ -532,6 +615,9 @@ func (m Model) renderHelp() string {
 		"",
 		"Calendar tips:",
 		"  '[' / ']' or '/' cycle account filter (All / per-account)",
+		"  w/d             week/day view",
+		"  ←/→             prev/next week/day",
+		"  h/l             prev/next day (week view)",
 		"",
 		"GitHub tips:",
 		"  '[' / ']' or '/' cycle account filter (All / per-account)",
@@ -540,10 +626,23 @@ func (m Model) renderHelp() string {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(strings.Join(lines, "\n"))
 }
 
+func (m Model) renderDivider() string {
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	if w < 10 {
+		w = 10
+	}
+	line := strings.Repeat("─", w)
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(line)
+}
+
 func (m *Model) reloadListFromState() {
 	surface := m.activeSurface()
 	if surface == "home" {
 		m.listItems = nil
+		m.refreshHomeViewport(false)
 		return
 	}
 	items, err := m.loadListItems(surface)
@@ -671,6 +770,7 @@ func (m *Model) listItemsFromLinear(obj map[string]any) []listItem {
 	var out []listItem
 	for _, it := range issues {
 		status, _ := it["status"].(string)
+		statusLabel := linearStatusLabel(status)
 		if !linearStatusMatchesFilter(status, filter) {
 			continue
 		}
@@ -685,9 +785,9 @@ func (m *Model) listItemsFromLinear(obj map[string]any) []listItem {
 		}
 		title, _ := it["title"].(string)
 		team, _ := it["team"].(string)
-		sub := status
+		sub := statusLabel
 		if team != "" {
-			sub = team + " · " + status
+			sub = team + " · " + statusLabel
 		}
 		shown := title
 		if identifier != "" {
@@ -780,6 +880,17 @@ func linearStatusMatchesFilter(status string, filter string) bool {
 	}
 }
 
+func linearStatusLabel(status string) string {
+	// Linear outputs "Name (type)"; the type is redundant in list rows.
+	if status == "" {
+		return ""
+	}
+	if i := strings.Index(status, " ("); i > 0 {
+		return strings.TrimSpace(status[:i])
+	}
+	return strings.TrimSpace(status)
+}
+
 func listItemsFromLinear(obj map[string]any) []listItem {
 	return nil
 }
@@ -791,6 +902,10 @@ func listItemsFromGcal(obj map[string]any) []listItem {
 func (m *Model) listItemsFromGithub(obj map[string]any) []listItem {
 	if obj == nil {
 		return nil
+	}
+	if repos, locals, err := readGithubTrackedConfig(filepath.Join(m.posDir, "skills", "github", "SKILL.md")); err == nil {
+		m.githubTrackedRepos = repos
+		m.githubTrackedLocal = locals
 	}
 	m.githubNotificationsErr, _ = obj["notifications_error"].(string)
 	if itemsErr, ok := obj["items_error"].(map[string]any); ok {
@@ -868,10 +983,10 @@ func (m *Model) listItemsFromGithub(obj map[string]any) []listItem {
 
 func (m Model) renderList() string {
 	surface := m.activeSurface()
-	header := strings.ToUpper(surface[:1]) + surface[1:]
 	if surface == "gcal" {
-		header = "Calendar"
+		return m.renderCalendar()
 	}
+	header := strings.ToUpper(surface[:1]) + surface[1:]
 	if surface == "github" {
 		header = "GitHub"
 	}
@@ -903,7 +1018,14 @@ func (m Model) renderList() string {
 		if m.githubAccountIdx > 0 && m.githubAccountIdx < len(m.githubAccounts) {
 			acct = m.githubAccounts[m.githubAccountIdx]
 		}
-		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Account: " + acct + " · View: " + m.githubFilterName() + ")"))
+		tracked := ""
+		if len(m.githubTrackedRepos) > 0 || len(m.githubTrackedLocal) > 0 {
+			tracked = fmt.Sprintf(" · Tracked: %d", len(m.githubTrackedRepos))
+			if len(m.githubTrackedLocal) > 0 {
+				tracked += fmt.Sprintf(" (%d local)", len(m.githubTrackedLocal))
+			}
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Account: " + acct + " · View: " + m.githubFilterName() + tracked + ")"))
 	}
 	b.WriteString("\n")
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(fmt.Sprintf("Selected: %d", m.selectedCount())))
@@ -981,42 +1103,629 @@ func (m Model) renderList() string {
 	}
 
 	b.WriteString("\n")
-	footer := "Space select · Enter detail · a actions · : commands · ? help"
+	footer := "Space select · Enter detail · o open · a actions · : commands · ? help"
 	if surface == "gmail" || surface == "gcal" {
-		footer = "Space select · Enter detail · a actions · [ ] or / account · : commands · ? help"
+		footer = "Space select · Enter detail · o open · a actions · [ ] or / account · : commands · ? help"
 	}
 	if surface == "linear" {
-		footer = "Space select · Enter detail · f filter · : commands · ? help"
+		footer = "Space select · Enter detail · o open · f filter · : commands · ? help"
 	}
 	if surface == "github" {
-		footer = "Enter detail · f filter · [ ] or / account · : commands · ? help"
+		footer = "Enter detail · o open · f filter · [ ] or / account · : commands · ? help"
 	}
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footer))
 	b.WriteString("\n")
 	return b.String()
 }
 
+func (m Model) renderCalendar() string {
+	var b strings.Builder
+	acct := "All"
+	if m.gcalAccountIdx > 0 && m.gcalAccountIdx < len(m.gcalAccounts) {
+		acct = m.gcalAccounts[m.gcalAccountIdx]
+	}
+	calID := m.gcalCalendarID
+	if calID == "" {
+		calID = "primary"
+	}
+	view := m.gcalView
+	if view == "" {
+		view = "week"
+	}
+
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Calendar"))
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (" + strings.Title(view) + " · Account: " + acct + " · Cal: " + calID + ")"))
+	b.WriteString("\n\n")
+
+	if len(m.listItems) == 0 {
+		empty := "No calendar events. Try :gcal sync (or increase days_ahead in skills/gcal/SKILL.md).\nCalendar: " + calID
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(empty))
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	if view == "day" {
+		b.WriteString(m.renderCalendarDay())
+	} else {
+		b.WriteString(m.renderCalendarWeek())
+	}
+	b.WriteString("\n\n")
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("←/→ nav · j/k move · enter detail · o open · / account · w week · d day · t today"))
+	b.WriteString("\n")
+	return b.String()
+}
+
+func (m Model) renderCalendarWeek() string {
+	weekStart := startOfWeek(m.gcalAnchor)
+	weekEnd := weekStart.AddDate(0, 0, 6)
+	weekLabel := weekStart.Format("Mon 02 Jan") + " – " + weekEnd.Format("Mon 02 Jan")
+
+	width := m.width - 2
+	if width < 70 {
+		width = 70
+	}
+	colW := width / 7
+	if colW < 10 {
+		colW = 10
+	}
+
+	days := m.gcalWeekEvents(weekStart)
+	maxRows := m.mainBudgetLines() - 7
+	if maxRows < 3 {
+		maxRows = 3
+	}
+	if maxRows > 12 {
+		maxRows = 12
+	}
+
+	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("62")).Foreground(lipgloss.Color("230"))
+	todayStyle := lipgloss.NewStyle().Bold(true)
+	dim := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+	var b strings.Builder
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(weekLabel))
+	b.WriteString("\n")
+
+	// Day headers
+	for i := 0; i < 7; i++ {
+		d := weekStart.AddDate(0, 0, i)
+		label := d.Format("Mon 2")
+		if sameDay(time.Now(), d) {
+			label = todayStyle.Render(label)
+		}
+		b.WriteString(truncate(padRight(label, colW), colW))
+	}
+	b.WriteString("\n")
+	for i := 0; i < 7; i++ {
+		b.WriteString(dim.Render(strings.Repeat("─", colW-1)))
+		b.WriteString(" ")
+	}
+	b.WriteString("\n")
+
+	for row := 0; row < maxRows; row++ {
+		for day := 0; day < 7; day++ {
+			cell := ""
+			items := days[day]
+			if row < len(items) {
+				cell = gcalEventCell(*items[row], colW)
+			} else if row == maxRows-1 && len(items) > maxRows {
+				cell = "… +" + fmt.Sprintf("%d", len(items)-maxRows+1)
+			}
+			cell = padRight(cell, colW)
+			if day == m.gcalDayIdx && row == m.gcalEventIdx {
+				cell = selectedStyle.Render(truncate(cell, colW))
+			} else {
+				cell = truncate(cell, colW)
+			}
+			b.WriteString(cell)
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m Model) renderCalendarDay() string {
+	day := startOfDay(m.gcalAnchor)
+	label := day.Format("Monday, 02 Jan 2006")
+	items := m.gcalEventsForDay(day)
+
+	var b strings.Builder
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(label))
+	b.WriteString("\n\n")
+	if len(items) == 0 {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("(no events)"))
+		return b.String()
+	}
+
+	pageSize := m.listPageSize()
+	if pageSize < 3 {
+		pageSize = 3
+	}
+	offset := m.gcalOffset
+	if offset < 0 {
+		offset = 0
+	}
+	eventIdx := clampInt(m.gcalEventIdx, 0, max(0, len(items)-1))
+	if eventIdx < offset {
+		offset = eventIdx
+	}
+	if eventIdx >= offset+pageSize {
+		offset = eventIdx - pageSize + 1
+	}
+
+	end := offset + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+	maxTitle := 80
+	if m.width > 0 {
+		maxTitle = max(20, m.width-10)
+	}
+	for i := offset; i < end; i++ {
+		it := *items[i]
+		cursor := "  "
+		if i == eventIdx {
+			cursor = "> "
+		}
+		line := cursor + truncate(gcalEventLine(it), maxTitle)
+		b.WriteString(line)
+		b.WriteString("\n")
+		meta := gcalEventMeta(it)
+		if meta != "" {
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("    " + truncate(meta, maxTitle)))
+			b.WriteString("\n")
+		}
+	}
+	if len(items) > end {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("…"))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *Model) updateGcalKeys(msg tea.KeyMsg) tea.Cmd {
+	s := msg.String()
+	switch s {
+	case "w":
+		m.gcalView = "week"
+		m.gcalOffset = 0
+		m.ensureGcalSelection()
+		return nil
+	case "d":
+		// Move anchor to the selected day when switching to day view.
+		weekStart := startOfWeek(m.gcalAnchor)
+		m.gcalAnchor = weekStart.AddDate(0, 0, clampInt(m.gcalDayIdx, 0, 6))
+		m.gcalView = "day"
+		m.gcalOffset = 0
+		m.ensureGcalSelection()
+		return nil
+	case "t":
+		m.gcalAnchor = time.Now()
+		if m.gcalView == "week" {
+			weekStart := startOfWeek(m.gcalAnchor)
+			m.gcalDayIdx = clampInt(int(startOfDay(time.Now()).Sub(weekStart).Hours()/24), 0, 6)
+			m.gcalEventIdx = 0
+		}
+		m.gcalOffset = 0
+		m.ensureGcalSelection()
+		return nil
+	case "left":
+		if m.gcalView == "day" {
+			m.gcalAnchor = m.gcalAnchor.AddDate(0, 0, -1)
+		} else {
+			m.gcalAnchor = m.gcalAnchor.AddDate(0, 0, -7)
+		}
+		m.gcalOffset = 0
+		m.ensureGcalSelection()
+		return nil
+	case "right":
+		if m.gcalView == "day" {
+			m.gcalAnchor = m.gcalAnchor.AddDate(0, 0, 1)
+		} else {
+			m.gcalAnchor = m.gcalAnchor.AddDate(0, 0, 7)
+		}
+		m.gcalOffset = 0
+		m.ensureGcalSelection()
+		return nil
+	case "h":
+		if m.gcalView == "week" {
+			m.gcalDayIdx = clampInt(m.gcalDayIdx-1, 0, 6)
+			m.gcalEventIdx = 0
+		} else {
+			m.gcalAnchor = m.gcalAnchor.AddDate(0, 0, -1)
+			m.gcalEventIdx = 0
+			m.gcalOffset = 0
+		}
+		m.ensureGcalSelection()
+		return nil
+	case "l":
+		if m.gcalView == "week" {
+			m.gcalDayIdx = clampInt(m.gcalDayIdx+1, 0, 6)
+			m.gcalEventIdx = 0
+		} else {
+			m.gcalAnchor = m.gcalAnchor.AddDate(0, 0, 1)
+			m.gcalEventIdx = 0
+			m.gcalOffset = 0
+		}
+		m.ensureGcalSelection()
+		return nil
+	case "[", "]", "/":
+		// Account cycling.
+		if len(m.gcalAccounts) == 0 {
+			return nil
+		}
+		if s == "[" {
+			m.gcalAccountIdx--
+			if m.gcalAccountIdx < 0 {
+				m.gcalAccountIdx = len(m.gcalAccounts) - 1
+			}
+		} else {
+			m.gcalAccountIdx = (m.gcalAccountIdx + 1) % len(m.gcalAccounts)
+		}
+		m.reloadListFromState()
+		m.ensureGcalSelection()
+		return nil
+	case "up", "k":
+		if m.gcalView == "week" {
+			if m.gcalEventIdx > 0 {
+				m.gcalEventIdx--
+			}
+		} else {
+			if m.gcalEventIdx > 0 {
+				m.gcalEventIdx--
+			}
+		}
+		m.ensureGcalSelection()
+		return nil
+	case "down", "j":
+		m.gcalEventIdx++
+		m.ensureGcalSelection()
+		return nil
+	case " ", "x":
+		if it := m.gcalSelectedItem(); it != nil {
+			m.listSelected[it.Key] = !m.listSelected[it.Key]
+		}
+		return nil
+	case "X":
+		// Select only what's currently visible.
+		if m.gcalView == "day" {
+			day := startOfDay(m.gcalAnchor)
+			items := m.gcalEventsForDay(day)
+			pageSize := m.listPageSize()
+			start := m.gcalOffset
+			end := start + pageSize
+			if end > len(items) {
+				end = len(items)
+			}
+			for i := start; i < end; i++ {
+				m.listSelected[items[i].Key] = true
+			}
+		}
+		return nil
+	case "u":
+		m.listSelected = map[string]bool{}
+		return nil
+	case "enter":
+		it := m.gcalSelectedItem()
+		if it == nil {
+			return nil
+		}
+		_ = m.eventsWriter.Append(events.Event{
+			Kind:     "view",
+			Surface:  "gcal",
+			Name:     "gcal.view",
+			Op:       "view",
+			Actor:    "user",
+			Entities: entitiesForItem("gcal", *it),
+			Summary:  truncate(it.Title, 120),
+			Data:     it.Raw,
+		})
+		m.mode = modeDetail
+		m.detailItem = it
+		m.detailSurface = "gcal"
+		m.detailText = ""
+		m.detailLoading = false
+		m.lastErr = ""
+		cmd := m.fetchDetailForItem("gcal", *it)
+		m.refreshDetailViewport(true)
+		return cmd
+	case "o":
+		it := m.gcalSelectedItem()
+		if it == nil {
+			return nil
+		}
+		return m.openItem("gcal", *it)
+	default:
+		return nil
+	}
+}
+
+func (m *Model) ensureGcalSelection() {
+	if m.gcalView == "day" {
+		day := startOfDay(m.gcalAnchor)
+		items := m.gcalEventsForDay(day)
+		if len(items) == 0 {
+			m.gcalEventIdx = 0
+			m.gcalOffset = 0
+			return
+		}
+		if m.gcalEventIdx < 0 {
+			m.gcalEventIdx = 0
+		}
+		if m.gcalEventIdx >= len(items) {
+			m.gcalEventIdx = len(items) - 1
+		}
+		if m.gcalOffset < 0 {
+			m.gcalOffset = 0
+		}
+		if m.gcalOffset > m.gcalEventIdx {
+			m.gcalOffset = m.gcalEventIdx
+		}
+		pageSize := m.listPageSize()
+		if pageSize < 3 {
+			pageSize = 3
+		}
+		if m.gcalEventIdx >= m.gcalOffset+pageSize {
+			m.gcalOffset = m.gcalEventIdx - pageSize + 1
+		}
+		if m.gcalOffset > max(0, len(items)-1) {
+			m.gcalOffset = max(0, len(items)-1)
+		}
+		return
+	}
+
+	weekStart := startOfWeek(m.gcalAnchor)
+	days := m.gcalWeekEvents(weekStart)
+	if m.gcalDayIdx < 0 {
+		m.gcalDayIdx = 0
+	}
+	if m.gcalDayIdx > 6 {
+		m.gcalDayIdx = 6
+	}
+	items := days[m.gcalDayIdx]
+	if len(items) == 0 {
+		m.gcalEventIdx = 0
+		return
+	}
+	if m.gcalEventIdx < 0 {
+		m.gcalEventIdx = 0
+	}
+	if m.gcalEventIdx >= len(items) {
+		m.gcalEventIdx = len(items) - 1
+	}
+}
+
+func (m *Model) gcalSelectedItem() *listItem {
+	if m.gcalView == "day" {
+		day := startOfDay(m.gcalAnchor)
+		items := m.gcalEventsForDay(day)
+		if len(items) == 0 {
+			return nil
+		}
+		idx := clampInt(m.gcalEventIdx, 0, len(items)-1)
+		return items[idx]
+	}
+	weekStart := startOfWeek(m.gcalAnchor)
+	days := m.gcalWeekEvents(weekStart)
+	day := clampInt(m.gcalDayIdx, 0, 6)
+	items := days[day]
+	if len(items) == 0 {
+		return nil
+	}
+	idx := clampInt(m.gcalEventIdx, 0, len(items)-1)
+	return items[idx]
+}
+
+func (m Model) gcalWeekEvents(weekStart time.Time) [7][]*listItem {
+	var out [7][]*listItem
+	for i := range m.listItems {
+		it := &m.listItems[i]
+		startStr, _ := it.Raw["start"].(string)
+		t, ok := parseISOOrDate(startStr)
+		if !ok {
+			continue
+		}
+		local := t.In(time.Local)
+		for day := 0; day < 7; day++ {
+			d := weekStart.AddDate(0, 0, day)
+			if sameDay(local, d) {
+				out[day] = append(out[day], it)
+				break
+			}
+		}
+	}
+	for i := 0; i < 7; i++ {
+		sort.SliceStable(out[i], func(a, b int) bool {
+			as, _ := out[i][a].Raw["start"].(string)
+			bs, _ := out[i][b].Raw["start"].(string)
+			at, aok := parseISOOrDate(as)
+			bt, bok := parseISOOrDate(bs)
+			if aok && bok {
+				return at.Before(bt)
+			}
+			return as < bs
+		})
+	}
+	return out
+}
+
+func (m Model) gcalEventsForDay(day time.Time) []*listItem {
+	var out []*listItem
+	for i := range m.listItems {
+		it := &m.listItems[i]
+		startStr, _ := it.Raw["start"].(string)
+		t, ok := parseISOOrDate(startStr)
+		if !ok {
+			continue
+		}
+		if sameDay(t.In(time.Local), day) {
+			out = append(out, it)
+		}
+	}
+	sort.SliceStable(out, func(a, b int) bool {
+		as, _ := out[a].Raw["start"].(string)
+		bs, _ := out[b].Raw["start"].(string)
+		at, aok := parseISOOrDate(as)
+		bt, bok := parseISOOrDate(bs)
+		if aok && bok {
+			return at.Before(bt)
+		}
+		return as < bs
+	})
+	return out
+}
+
+func gcalEventCell(it listItem, width int) string {
+	startStr, _ := it.Raw["start"].(string)
+	start, _ := parseISOOrDate(startStr)
+	prefix := "▓"
+	if !strings.Contains(startStr, "T") {
+		prefix = "░"
+	}
+	timePart := start.In(time.Local).Format("15:04")
+	if prefix == "░" {
+		timePart = "all"
+	}
+	cell := fmt.Sprintf("%s %s %s", prefix, timePart, it.Title)
+	return truncate(cell, width)
+}
+
+func gcalEventLine(it listItem) string {
+	startStr, _ := it.Raw["start"].(string)
+	endStr, _ := it.Raw["end"].(string)
+	start, _ := parseISOOrDate(startStr)
+	end, _ := parseISOOrDate(endStr)
+	if strings.Contains(startStr, "T") {
+		return start.In(time.Local).Format("15:04") + "–" + end.In(time.Local).Format("15:04") + "  " + it.Title
+	}
+	return "all-day  " + it.Title
+}
+
+func gcalEventMeta(it listItem) string {
+	acct, _ := it.Raw["account"].(string)
+	return acct
+}
+
+func startOfWeek(t time.Time) time.Time {
+	local := t.In(time.Local)
+	start := startOfDay(local)
+	wd := int(start.Weekday())
+	// Monday as start of week.
+	delta := (wd + 6) % 7
+	return start.AddDate(0, 0, -delta)
+}
+
+func startOfDay(t time.Time) time.Time {
+	local := t.In(time.Local)
+	return time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, local.Location())
+}
+
+func clampInt(v int, lo int, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func padRight(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) >= n {
+		return string(r[:n])
+	}
+	return s + strings.Repeat(" ", n-len(r))
+}
+
 func (m Model) listPageSize() int {
-	if m.height <= 0 {
-		return 8
-	}
-	// Rough layout budget:
-	// - 1 header line + 1 selected line + 1 blank + 1 footer + 1 blank
-	// - Run panel consumes ~1/4 of the remaining height (min 6)
-	runLines := max(6, m.height/4)
-	mainBudget := m.height - (2 + 2 + runLines)
-	if mainBudget < 6 {
-		mainBudget = 6
-	}
+	budget := m.mainBudgetLines()
 	// Each item is ~2 lines.
-	rows := mainBudget / 2
+	rows := budget / 2
 	if rows < 3 {
 		rows = 3
+	}
+	// UX: keep lists compact by default.
+	if rows > 10 {
+		rows = 10
 	}
 	return rows
 }
 
+func (m Model) runPanelLines() int {
+	if m.height <= 0 {
+		return 12
+	}
+	lines := m.height / 4
+	if lines < 6 {
+		lines = 6
+	}
+	if lines > 12 {
+		lines = 12
+	}
+	// Ensure we leave enough space for the main panel.
+	minMain := 10
+	fixed := 1 + 1 + 1 + 1 + 1 + 1 // header, tabs, status, blank, main/run blank, run header
+	cmdLines := 0
+	if m.cmdMode {
+		cmdLines = 2
+	}
+	if m.height-(fixed+cmdLines+lines) < minMain {
+		lines = m.height - (fixed + cmdLines + minMain)
+	}
+	if lines < 4 {
+		lines = 4
+	}
+	return lines
+}
+
+func (m Model) mainBudgetLines() int {
+	if m.height <= 0 {
+		return 20
+	}
+	runLines := m.runPanelLines()
+	// Header + tabs + status + blank + blank + run header.
+	used := 1 + 1 + 1 + 1 + 1 + 1 + runLines
+	if m.cmdMode {
+		used += 2
+	}
+	budget := m.height - used
+	if budget < 6 {
+		budget = 6
+	}
+	return budget
+}
+
 func (m Model) renderDetail() string {
+	if m.detailVP.Width > 0 && m.detailVP.Height > 0 {
+		content := m.detailVP.View()
+		surface := m.detailSurface
+		if surface == "" {
+			surface = m.activeSurface()
+		}
+		footer := m.renderDetailFooter(surface)
+		if footer != "" {
+			return content + "\n" + footer
+		}
+		return content
+	}
+	return m.renderDetailContent()
+}
+
+func (m Model) renderDetailFooter(surface string) string {
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	switch surface {
+	case "gmail":
+		return style.Render("r reply  R reply-all  f forward  l label  a archive  o open")
+	default:
+		return style.Render("j/k scroll  o open  esc back")
+	}
+}
+
+func (m Model) renderDetailContent() string {
 	var b strings.Builder
 	surface := m.detailSurface
 	if surface == "" {
@@ -1026,8 +1735,12 @@ func (m Model) renderDetail() string {
 	if surface == "gcal" {
 		name = "Calendar"
 	}
+	if surface == "github" {
+		name = "GitHub"
+	}
+
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render(name))
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Esc back)"))
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Esc back · o open)"))
 	b.WriteString("\n\n")
 
 	if m.detailItem != nil {
@@ -1039,8 +1752,10 @@ func (m Model) renderDetail() string {
 
 			b.WriteString(lipgloss.NewStyle().Bold(true).Render(subject))
 			b.WriteString("\n")
-			b.WriteString(renderLabelValue("From", from))
-			b.WriteString("\n")
+			if from != "" {
+				b.WriteString(renderLabelValue("From", from))
+				b.WriteString("\n")
+			}
 			if acct != "" {
 				b.WriteString(renderLabelValue("Account", acct))
 				b.WriteString("\n")
@@ -1053,12 +1768,9 @@ func (m Model) renderDetail() string {
 		} else {
 			b.WriteString(lipgloss.NewStyle().Bold(true).Render(m.detailItem.Title))
 			b.WriteString("\n")
-			if m.detailItem.Subtitle != "" {
-				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(m.detailItem.Subtitle))
-				b.WriteString("\n")
-			}
-			if m.detailItem.Meta != "" {
-				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(m.detailItem.Meta))
+			meta := strings.TrimSpace(strings.Trim(strings.Join([]string{m.detailItem.Subtitle, m.detailItem.Meta}, " · "), " ·"))
+			if meta != "" {
+				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(meta))
 				b.WriteString("\n")
 			}
 			b.WriteString("\n")
@@ -1071,32 +1783,59 @@ func (m Model) renderDetail() string {
 		return b.String()
 	}
 
-	if m.detailText != "" {
-		text := m.detailText
-		if surface == "gmail" {
-			text = stripGmailThreadHeaders(text)
-		}
-		if surface == "github" || surface == "gcal" {
-			var v any
-			if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &v); err == nil {
-				text = prettyJSON(v)
-			}
-		}
-		if m.width > 0 {
-			w := m.width - 2
-			if w < 20 {
-				w = 20
-			}
-			text = hardWrap(text, w)
-		}
-		b.WriteString(text)
+	text := strings.TrimSpace(m.detailText)
+	if text == "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("(no detail)"))
 		b.WriteString("\n")
 		return b.String()
 	}
 
-	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("(no detail)"))
-	b.WriteString("\n")
-	return b.String()
+	w := m.width - 2
+	if w < 20 {
+		w = 20
+	}
+
+	switch surface {
+	case "gmail":
+		body := stripGmailThreadHeaders(text)
+		body = normalizeNewlines(body)
+		body = stripEmailSignature(body)
+		body = normalizeBlankLines(body, 1)
+		body = linkifyBareDomains(body)
+		body = wrapPreserveURLs(body, w)
+		b.WriteString(body)
+		b.WriteString("\n")
+		return b.String()
+	case "linear":
+		body := normalizeNewlines(text)
+		body = normalizeBlankLines(body, 1)
+		body = linkifyBareDomains(body)
+		body = wrapPreserveURLs(body, w)
+		b.WriteString(body)
+		b.WriteString("\n")
+		return b.String()
+	case "gcal":
+		body := normalizeNewlines(text)
+		body = normalizeBlankLines(body, 1)
+		body = formatGcalDetail(body, w)
+		b.WriteString(body)
+		b.WriteString("\n")
+		return b.String()
+	case "github":
+		body := normalizeNewlines(text)
+		body = normalizeBlankLines(body, 1)
+		body = formatGithubDetail(body, w, m.detailItem)
+		b.WriteString(body)
+		b.WriteString("\n")
+		return b.String()
+	default:
+		body := normalizeNewlines(text)
+		body = normalizeBlankLines(body, 1)
+		body = wrapPreserveURLs(body, w)
+		b.WriteString(body)
+		b.WriteString("\n")
+		return b.String()
+	}
 }
 
 func (m Model) renderActionPicker() string {
@@ -1122,6 +1861,9 @@ func (m Model) renderActionPicker() string {
 func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 	surface := m.activeSurface()
 	s := msg.String()
+	if surface == "gcal" {
+		return m.updateGcalKeys(msg)
+	}
 	switch s {
 	case "up", "k":
 		if m.listCursor > 0 {
@@ -1143,8 +1885,17 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 		m.listSelected[key] = !m.listSelected[key]
 		return nil
 	case "X":
-		for _, it := range m.listItems {
-			m.listSelected[it.Key] = true
+		pageSize := m.listPageSize()
+		start := m.listOffset
+		end := start + pageSize
+		if start < 0 {
+			start = 0
+		}
+		if end > len(m.listItems) {
+			end = len(m.listItems)
+		}
+		for i := start; i < end; i++ {
+			m.listSelected[m.listItems[i].Key] = true
 		}
 		return nil
 	case "u":
@@ -1231,13 +1982,31 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 		it := m.listItems[m.listCursor]
+		_ = m.eventsWriter.Append(events.Event{
+			Kind:     "view",
+			Surface:  surface,
+			Name:     surface + ".view",
+			Op:       "view",
+			Actor:    "user",
+			Entities: entitiesForItem(surface, it),
+			Summary:  truncate(it.Title, 120),
+			Data:     it.Raw,
+		})
 		m.mode = modeDetail
 		m.detailItem = &it
 		m.detailSurface = surface
 		m.detailText = ""
 		m.detailLoading = false
 		m.lastErr = ""
-		return m.fetchDetailForItem(surface, it)
+		cmd := m.fetchDetailForItem(surface, it)
+		m.refreshDetailViewport(true)
+		return cmd
+	case "o":
+		if len(m.listItems) == 0 {
+			return nil
+		}
+		it := m.listItems[m.listCursor]
+		return m.openItem(surface, it)
 	case "a":
 		if m.selectedCount() == 0 {
 			m.lastErr = "select items first (Space)"
@@ -1283,6 +2052,292 @@ func (m *Model) updateActionPickerKeys(msg tea.KeyMsg) tea.Cmd {
 	default:
 		return nil
 	}
+}
+
+func (m *Model) updateDetailKeys(msg tea.KeyMsg) tea.Cmd {
+	surface := m.detailSurface
+	if surface == "" {
+		surface = m.activeSurface()
+	}
+
+	s := msg.String()
+	switch s {
+	case "o":
+		if m.detailItem == nil {
+			m.lastErr = "no item selected"
+			return nil
+		}
+		return m.openItem(surface, *m.detailItem)
+	case "a":
+		if surface == "gmail" {
+			if m.detailItem == nil {
+				m.lastErr = "no item selected"
+				return nil
+			}
+			m.listSelected = map[string]bool{m.detailItem.Key: true}
+			opts := m.actionOptionsForSurface("gmail")
+			if len(opts) == 0 {
+				m.lastErr = "no actions"
+				return nil
+			}
+			m.actionOptions = opts
+			m.actionCursor = 0
+			m.mode = modeActionPicker
+			return nil
+		}
+		return nil
+	case "r", "R", "f", "l":
+		if surface == "gmail" {
+			m.lastInfo = "not implemented yet"
+			return nil
+		}
+	case "g":
+		m.detailVP.GotoTop()
+		return nil
+	case "G":
+		m.detailVP.GotoBottom()
+		return nil
+	}
+	// Vim-style scrolling.
+	if s == "j" {
+		msg = tea.KeyMsg{Type: tea.KeyDown}
+	}
+	if s == "k" {
+		msg = tea.KeyMsg{Type: tea.KeyUp}
+	}
+
+	var cmd tea.Cmd
+	m.detailVP, cmd = m.detailVP.Update(msg)
+	return cmd
+}
+
+func (m *Model) resizeDetailViewport() {
+	if m.mode != modeDetail {
+		return
+	}
+	w := m.width - 2
+	if w < 20 {
+		w = 20
+	}
+	h := m.mainBudgetLines()
+	// Leave room for the fixed footer bar.
+	if h > 1 {
+		h = h - 1
+	}
+	if h < 6 {
+		h = 6
+	}
+	m.detailVP.Width = w
+	m.detailVP.Height = h
+}
+
+func (m *Model) refreshDetailViewport(resetTop bool) {
+	if m.mode != modeDetail {
+		return
+	}
+	m.resizeDetailViewport()
+	m.detailVP.SetContent(m.renderDetailContent())
+	if resetTop {
+		m.detailVP.GotoTop()
+	}
+}
+
+func (m *Model) openItem(surface string, it listItem) tea.Cmd {
+	m.pendingOpenSurface = surface
+	m.pendingOpenSummary = truncate(it.Title, 120)
+	m.pendingOpenEntities = entitiesForItem(surface, it)
+	switch surface {
+	case "gmail":
+		threadID, _ := it.Raw["id"].(string)
+		acct, _ := it.Raw["account"].(string)
+		if acct == "" || threadID == "" {
+			m.pendingOpenSurface = ""
+			m.pendingOpenSummary = ""
+			m.pendingOpenEntities = nil
+			m.lastErr = "missing gmail thread"
+			return nil
+		}
+		return openGmailThreadURLCmd(acct, threadID)
+	case "linear":
+		identifier, _ := it.Raw["identifier"].(string)
+		if identifier == "" {
+			return openURLCmd("https://linear.app")
+		}
+		u := "https://linear.app/search?query=" + url.QueryEscape(identifier)
+		return openURLCmd(u)
+	case "gcal":
+		eventID, _ := it.Raw["id"].(string)
+		acct, _ := it.Raw["account"].(string)
+		calID, _ := it.Raw["calendar_id"].(string)
+		if calID == "" {
+			calID = m.gcalCalendarID
+		}
+		if calID == "" {
+			calID = "primary"
+		}
+		if acct == "" || eventID == "" {
+			m.pendingOpenSurface = ""
+			m.pendingOpenSummary = ""
+			m.pendingOpenEntities = nil
+			m.lastErr = "missing calendar event"
+			return nil
+		}
+		return openGcalEventURLCmd(acct, calID, eventID)
+	case "github":
+		if u, ok := it.Raw["url"].(string); ok && u != "" {
+			return openURLCmd(u)
+		}
+		if it.Meta != "" {
+			return openURLCmd(it.Meta)
+		}
+		m.pendingOpenSurface = ""
+		m.pendingOpenSummary = ""
+		m.pendingOpenEntities = nil
+		m.lastErr = "no url"
+		return nil
+	default:
+		m.pendingOpenSurface = ""
+		m.pendingOpenSummary = ""
+		m.pendingOpenEntities = nil
+		return nil
+	}
+}
+
+func openURLCmd(u string) tea.Cmd {
+	return func() tea.Msg {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			return openURLMsg{err: errors.New("no url")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.CommandContext(ctx, "open", u)
+		default:
+			cmd = exec.CommandContext(ctx, "xdg-open", u)
+		}
+		err := cmd.Run()
+		if ctx.Err() != nil && err == nil {
+			err = ctx.Err()
+		}
+		return openURLMsg{url: u, err: err}
+	}
+}
+
+func openGmailThreadURLCmd(account string, threadID string) tea.Cmd {
+	return func() tea.Msg {
+		if account == "" || threadID == "" {
+			return openURLMsg{err: errors.New("missing gmail account or thread id")}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "gmcli", account, "url", threadID)
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() != nil && err == nil {
+			err = ctx.Err()
+		}
+		if err != nil {
+			return openURLMsg{err: fmt.Errorf("gmcli url: %w (%s)", err, strings.TrimSpace(string(out)))}
+		}
+		line := strings.TrimSpace(string(out))
+		parts := strings.Split(line, "\t")
+		u := ""
+		if len(parts) >= 2 {
+			u = strings.TrimSpace(parts[len(parts)-1])
+		}
+		if u == "" {
+			return openURLMsg{err: errors.New("could not parse gmail url")}
+		}
+		return openURLCmd(u)()
+	}
+}
+
+func openGcalEventURLCmd(account string, calendarID string, eventID string) tea.Cmd {
+	return func() tea.Msg {
+		if account == "" || eventID == "" {
+			return openURLMsg{err: errors.New("missing calendar account or event id")}
+		}
+		if calendarID == "" {
+			calendarID = "primary"
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "gccli", account, "event", calendarID, eventID)
+		out, err := cmd.CombinedOutput()
+		if ctx.Err() != nil && err == nil {
+			err = ctx.Err()
+		}
+		if err != nil {
+			return openURLMsg{err: fmt.Errorf("gccli event: %w (%s)", err, strings.TrimSpace(string(out)))}
+		}
+		link := extractFirstKVValue(string(out), "Link")
+		if link == "" {
+			return openURLMsg{err: errors.New("no Link found in event")}
+		}
+		return openURLCmd(link)()
+	}
+}
+
+func entitiesForItem(surface string, it listItem) []events.EventEntity {
+	switch surface {
+	case "gmail":
+		threadID, _ := it.Raw["id"].(string)
+		acct, _ := it.Raw["account"].(string)
+		id := threadID
+		if acct != "" {
+			id = acct + ":" + threadID
+		}
+		if id == "" {
+			return nil
+		}
+		return []events.EventEntity{{Type: "email_thread", ID: id}}
+	case "linear":
+		identifier, _ := it.Raw["identifier"].(string)
+		if identifier == "" {
+			identifier, _ = it.Raw["id"].(string)
+		}
+		if identifier == "" {
+			return nil
+		}
+		return []events.EventEntity{{Type: "linear_issue", ID: identifier}}
+	case "gcal":
+		id, _ := it.Raw["id"].(string)
+		acct, _ := it.Raw["account"].(string)
+		key := id
+		if acct != "" {
+			key = acct + ":" + id
+		}
+		if key == "" {
+			return nil
+		}
+		return []events.EventEntity{{Type: "calendar_event", ID: key}}
+	case "github":
+		kind, _ := it.Raw["kind"].(string)
+		repo, _ := it.Raw["repo"].(string)
+		num := intFromAny(it.Raw["number"])
+		if repo == "" || num <= 0 {
+			return nil
+		}
+		t := "github_item"
+		if kind == "pr" {
+			t = "github_pr"
+		}
+		if kind == "issue" {
+			t = "github_issue"
+		}
+		return []events.EventEntity{{Type: t, ID: fmt.Sprintf("%s#%d", repo, num)}}
+	default:
+		return nil
+	}
+}
+
+func firstNonEmpty(a string, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
 }
 
 func (m *Model) actionOptionsForSurface(surface string) []actionOption {
@@ -1517,6 +2572,177 @@ func deriveStringList(v any) []string {
 	return out
 }
 
+func readGithubTrackedConfig(skillPath string) ([]string, []string, error) {
+	front, _, err := readFrontmatter(skillPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	repos := anyToStringSlice(front["tracked_repos"])
+	locals := anyToStringSlice(front["tracked_local"])
+	sort.Strings(repos)
+	sort.Strings(locals)
+	return uniqueStrings(repos), uniqueStrings(locals), nil
+}
+
+func updateGithubTrackedConfig(skillPath string, addRepos []string, removeRepos []string, addLocal []string, removeLocal []string) error {
+	front, body, err := readFrontmatter(skillPath)
+	if err != nil {
+		return err
+	}
+
+	repos := stringSliceToSet(anyToStringSlice(front["tracked_repos"]))
+	locals := stringSliceToSet(anyToStringSlice(front["tracked_local"]))
+	for _, r := range addRepos {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			repos[r] = true
+		}
+	}
+	for _, r := range removeRepos {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			delete(repos, r)
+		}
+	}
+	for _, p := range addLocal {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			locals[p] = true
+		}
+	}
+	for _, p := range removeLocal {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			delete(locals, p)
+		}
+	}
+
+	front["tracked_repos"] = setToSortedSlice(repos)
+	if len(locals) > 0 {
+		front["tracked_local"] = setToSortedSlice(locals)
+	} else {
+		delete(front, "tracked_local")
+	}
+
+	frontYAML, err := yaml.Marshal(front)
+	if err != nil {
+		return err
+	}
+
+	newContent := "---\n" + string(frontYAML) + "---\n" + body
+	if err := os.WriteFile(skillPath, []byte(newContent), 0o644); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readFrontmatter(path string) (map[string]any, string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	content := string(b)
+	lines := strings.Split(normalizeNewlines(content), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return nil, content, errors.New("missing frontmatter")
+	}
+	end := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return nil, content, errors.New("unterminated frontmatter")
+	}
+	fmText := strings.Join(lines[1:end], "\n")
+	body := "\n" + strings.Join(lines[end+1:], "\n")
+	front := map[string]any{}
+	if err := yaml.Unmarshal([]byte(fmText), &front); err != nil {
+		return nil, content, err
+	}
+	return front, body, nil
+}
+
+func anyToStringSlice(v any) []string {
+	switch t := v.(type) {
+	case []string:
+		return append([]string{}, t...)
+	case []any:
+		var out []string
+		for _, it := range t {
+			s, ok := it.(string)
+			if ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	case nil:
+		return nil
+	default:
+		return nil
+	}
+}
+
+func uniqueStrings(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func stringSliceToSet(in []string) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out[s] = true
+		}
+	}
+	return out
+}
+
+func setToSortedSlice(m map[string]bool) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func resolveGithubRepoFromLocalPath(path string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "remote", "get-url", "origin")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil && err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		return "", fmt.Errorf("git remote get-url origin: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	remote := strings.TrimSpace(string(out))
+	remote = strings.TrimSuffix(remote, ".git")
+	if strings.HasPrefix(remote, "git@github.com:") {
+		return strings.TrimPrefix(remote, "git@github.com:"), nil
+	}
+	if strings.HasPrefix(remote, "https://github.com/") {
+		return strings.TrimPrefix(remote, "https://github.com/"), nil
+	}
+	if strings.HasPrefix(remote, "ssh://git@github.com/") {
+		return strings.TrimPrefix(remote, "ssh://git@github.com/"), nil
+	}
+	return "", fmt.Errorf("unsupported remote url: %s", remote)
+}
+
 func intFromAny(v any) int {
 	switch t := v.(type) {
 	case int:
@@ -1611,6 +2837,221 @@ func prettyJSON(v any) string {
 	return string(b)
 }
 
+func normalizeNewlines(s string) string {
+	// gmcli/gccli output can include CRLF; normalize so wrapping and blank-line collapsing is stable.
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return s
+}
+
+func normalizeBlankLines(s string, maxBlank int) string {
+	if maxBlank < 0 {
+		maxBlank = 0
+	}
+	lines := strings.Split(normalizeNewlines(s), "\n")
+	var out []string
+	blankRun := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			blankRun++
+			if blankRun <= maxBlank {
+				out = append(out, "")
+			}
+			continue
+		}
+		blankRun = 0
+		out = append(out, strings.TrimRight(line, " \t"))
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func stripEmailSignature(s string) string {
+	lines := strings.Split(normalizeNewlines(s), "\n")
+	cut := -1
+	barRE := regexp.MustCompile(`^\|{4,}$`)
+	underscoreRE := regexp.MustCompile(`^_{4,}$`)
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := strings.TrimSpace(lines[i])
+		if l == "" {
+			continue
+		}
+		if l == "--" || l == "-- " || l == "—" || l == "—-" {
+			cut = i
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(l), "sent from my") {
+			cut = i
+			break
+		}
+		if strings.Contains(strings.ToLower(l), "unsubscribe") {
+			cut = i
+			break
+		}
+		if barRE.MatchString(l) || underscoreRE.MatchString(l) {
+			cut = i
+			break
+		}
+		if strings.Count(l, "|") >= 6 {
+			cut = i
+			break
+		}
+	}
+	if cut > 0 {
+		lines = lines[:cut]
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func linkifyBareDomains(s string) string {
+	// Lightweight linkify so macOS terminals make common domains clickable.
+	// We intentionally avoid touching emails, and we don't rewrite http(s) URLs.
+	s = normalizeNewlines(s)
+	// Match domains that are preceded by start/whitespace/open-paren and not part of an email.
+	re := regexp.MustCompile(`(?i)(^|[\s(\[])([a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:/[^\s)\]]*)?)`)
+	return re.ReplaceAllString(s, `${1}https://${2}`)
+}
+
+func wrapPreserveURLs(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+	text = normalizeNewlines(text)
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			out = append(out, "")
+			continue
+		}
+		indent := leadingWhitespace(line)
+		words := strings.Fields(strings.TrimSpace(line))
+		if len(words) == 0 {
+			out = append(out, "")
+			continue
+		}
+		cur := indent
+		curLen := runeLen(cur)
+		limit := width
+		if limit < curLen+10 {
+			limit = curLen + 10
+		}
+		for _, w := range words {
+			wLen := runeLen(w)
+			if curLen == runeLen(indent) {
+				cur += w
+				curLen += wLen
+				continue
+			}
+			if curLen+1+wLen > limit {
+				out = append(out, cur)
+				cur = indent + w
+				curLen = runeLen(indent) + wLen
+				continue
+			}
+			cur += " " + w
+			curLen += 1 + wLen
+		}
+		out = append(out, cur)
+	}
+	return strings.TrimRight(strings.Join(out, "\n"), "\n")
+}
+
+func leadingWhitespace(s string) string {
+	for i, r := range s {
+		if r != ' ' && r != '\t' {
+			return s[:i]
+		}
+	}
+	return s
+}
+
+func runeLen(s string) int {
+	return len([]rune(s))
+}
+
+func extractFirstKVValue(text string, key string) string {
+	prefix := key + ":"
+	for _, line := range strings.Split(normalizeNewlines(text), "\n") {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(l, prefix))
+		}
+	}
+	return ""
+}
+
+func formatGcalDetail(text string, width int) string {
+	// Prefer a clean key/value view with the Link on its own line for cmd+click.
+	lines := strings.Split(normalizeNewlines(text), "\n")
+	var out []string
+	for _, line := range lines {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		out = append(out, l)
+	}
+	joined := strings.Join(out, "\n")
+	joined = normalizeBlankLines(joined, 1)
+	joined = linkifyBareDomains(joined)
+	return wrapPreserveURLs(joined, width)
+}
+
+func formatGithubDetail(text string, width int, it *listItem) string {
+	var v map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &v); err != nil {
+		return wrapPreserveURLs(text, width)
+	}
+
+	title, _ := v["title"].(string)
+	body, _ := v["body"].(string)
+	state, _ := v["state"].(string)
+	urlStr, _ := v["url"].(string)
+	updatedAt, _ := v["updatedAt"].(string)
+	author := ""
+	if am, ok := v["author"].(map[string]any); ok {
+		author, _ = am["login"].(string)
+	}
+	repo := ""
+	if it != nil {
+		repo, _ = it.Raw["repo"].(string)
+	}
+
+	var b strings.Builder
+	if title != "" {
+		b.WriteString(lipgloss.NewStyle().Bold(true).Render(title))
+		b.WriteString("\n")
+	}
+	meta := strings.TrimSpace(strings.Trim(strings.Join([]string{repo, state, author}, " · "), " ·"))
+	if updatedAt != "" {
+		meta = strings.TrimSpace(strings.Trim(strings.Join([]string{meta, "updated " + humanAgeFromISO(updatedAt)}, " · "), " ·"))
+	}
+	if meta != "" {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(meta))
+		b.WriteString("\n")
+	}
+	if urlStr != "" {
+		b.WriteString(renderLabelValue("URL", urlStr))
+		b.WriteString("\n")
+	}
+
+	if strings.TrimSpace(body) != "" {
+		b.WriteString("\n")
+		body = normalizeNewlines(body)
+		body = normalizeBlankLines(body, 1)
+		body = linkifyBareDomains(body)
+		b.WriteString(wrapPreserveURLs(body, width))
+		b.WriteString("\n")
+	}
+
+	// Raw JSON (code-like)
+	b.WriteString("\n")
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Raw"))
+	b.WriteString("\n")
+	raw := prettyJSON(v)
+	b.WriteString(raw)
+	return strings.TrimSpace(b.String())
+}
+
 func renderLabelValue(label string, value string) string {
 	labelStyle := lipgloss.NewStyle().Bold(true)
 	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
@@ -1686,7 +3127,18 @@ func max(a, b int) int {
 }
 
 func (m *Model) renderHome() string {
+	if m.homeVP.Width > 0 && m.homeVP.Height > 0 {
+		return m.homeVP.View()
+	}
+	return m.renderHomeContent()
+}
+
+func (m *Model) renderHomeContent() string {
 	var out strings.Builder
+	out.WriteString(lipgloss.NewStyle().Bold(true).Render("Home"))
+	out.WriteString("\n")
+	out.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("j/k scroll · Tab switch apps · ':' commands"))
+	out.WriteString("\n\n")
 	for _, w := range m.homeCfg.Widgets {
 		out.WriteString(lipgloss.NewStyle().Bold(true).Render(w.Title))
 		out.WriteString("\n")
@@ -1703,7 +3155,55 @@ func (m *Model) renderHome() string {
 		}
 		out.WriteString("\n")
 	}
-	return out.String()
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func (m *Model) resizeHomeViewport() {
+	if m.mode != modeHome {
+		return
+	}
+	w := m.width - 2
+	if w < 20 {
+		w = 20
+	}
+	h := m.mainBudgetLines()
+	if h < 6 {
+		h = 6
+	}
+	m.homeVP.Width = w
+	m.homeVP.Height = h
+}
+
+func (m *Model) refreshHomeViewport(resetTop bool) {
+	if m.mode != modeHome {
+		return
+	}
+	m.resizeHomeViewport()
+	m.homeVP.SetContent(m.renderHomeContent())
+	if resetTop {
+		m.homeVP.GotoTop()
+	}
+}
+
+func (m *Model) updateHomeKeys(msg tea.KeyMsg) tea.Cmd {
+	s := msg.String()
+	switch s {
+	case "g":
+		m.homeVP.GotoTop()
+		return nil
+	case "G":
+		m.homeVP.GotoBottom()
+		return nil
+	}
+	if s == "j" {
+		msg = tea.KeyMsg{Type: tea.KeyDown}
+	}
+	if s == "k" {
+		msg = tea.KeyMsg{Type: tea.KeyUp}
+	}
+	var cmd tea.Cmd
+	m.homeVP, cmd = m.homeVP.Update(msg)
+	return cmd
 }
 
 func (m *Model) renderWidget(w config.WidgetConfig) ([]string, error) {
@@ -1775,11 +3275,16 @@ func extractSurfaceArray(surface string, v any) []any {
 	case "linear":
 		key = "issues"
 	case "github":
-		// Prefer accounts for the "GitHub — Accounts" widget.
+		// Prefer actionable items (PRs/issues) over auth metadata.
+		if arr, ok := obj["items"].([]any); ok {
+			return arr
+		}
+		if arr, ok := obj["notifications"].([]any); ok {
+			return arr
+		}
 		if arr, ok := obj["accounts"].([]any); ok {
 			return arr
 		}
-		key = "notifications"
 	}
 	if key != "" {
 		if arr, ok := obj[key].([]any); ok {
@@ -1945,6 +3450,77 @@ func (m *Model) readRecentEvents() ([]any, error) {
 
 func (m *Model) execCommand(line string) tea.Cmd {
 	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		m.lastErr = "empty command"
+		return nil
+	}
+	if fields[0] == "github" && len(fields) >= 2 {
+		skillPath := filepath.Join(m.posDir, "skills", "github", "SKILL.md")
+		sub := fields[1]
+		switch sub {
+		case "track":
+			if len(fields) < 3 {
+				m.lastErr = "usage: github track <owner/repo>"
+				return nil
+			}
+			repo := fields[2]
+			if err := updateGithubTrackedConfig(skillPath, []string{repo}, nil, nil, nil); err != nil {
+				m.lastErr = err.Error()
+				return nil
+			}
+			m.lastInfo = "tracked: " + repo + " (run :github sync)"
+			return nil
+		case "untrack":
+			if len(fields) < 3 {
+				m.lastErr = "usage: github untrack <owner/repo>"
+				return nil
+			}
+			repo := fields[2]
+			if err := updateGithubTrackedConfig(skillPath, nil, []string{repo}, nil, nil); err != nil {
+				m.lastErr = err.Error()
+				return nil
+			}
+			m.lastInfo = "untracked: " + repo + " (run :github sync)"
+			return nil
+		case "track-local":
+			if len(fields) < 3 {
+				m.lastErr = "usage: github track-local <path>"
+				return nil
+			}
+			path := fields[2]
+			repo, err := resolveGithubRepoFromLocalPath(path)
+			if err != nil {
+				m.lastErr = err.Error()
+				return nil
+			}
+			if err := updateGithubTrackedConfig(skillPath, []string{repo}, nil, []string{path}, nil); err != nil {
+				m.lastErr = err.Error()
+				return nil
+			}
+			m.lastInfo = "tracked local: " + path + " → " + repo + " (run :github sync)"
+			return nil
+		case "untrack-local":
+			if len(fields) < 3 {
+				m.lastErr = "usage: github untrack-local <path>"
+				return nil
+			}
+			path := fields[2]
+			if err := updateGithubTrackedConfig(skillPath, nil, nil, nil, []string{path}); err != nil {
+				m.lastErr = err.Error()
+				return nil
+			}
+			m.lastInfo = "untracked local: " + path + " (run :github sync)"
+			return nil
+		case "tracked":
+			repos, locals, err := readGithubTrackedConfig(skillPath)
+			if err != nil {
+				m.lastErr = err.Error()
+				return nil
+			}
+			m.lastInfo = fmt.Sprintf("tracked repos: %d · local: %d", len(repos), len(locals))
+			return nil
+		}
+	}
 	if len(fields) < 2 {
 		m.lastErr = "command must be: <surface> <sync|propose|apply>"
 		return nil

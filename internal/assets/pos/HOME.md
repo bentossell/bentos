@@ -20,14 +20,14 @@ widgets:
     columns: ["identifier", "title", "status", "age"]
     max_rows: 8
 
-  - id: github_accounts
-    title: GitHub — Accounts
+  - id: github_recent
+    title: GitHub — Recent
     type: table
     source: state
     surface: github
     path: STATE/github.json
-    query: "active == true"
-    columns: ["login", "scopes"]
+    query: "true"
+    columns: ["repo", "number", "title", "state", "age"]
     max_rows: 8
 
   - id: today_calendar
