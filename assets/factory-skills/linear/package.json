@@ -1,0 +1,6 @@
+{
+  "name": "linear",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Minimal CLI tools for Linear issue management"
+}
