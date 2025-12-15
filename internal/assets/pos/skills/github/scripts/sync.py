@@ -161,6 +161,50 @@ def main() -> int:
 				},
 			)
 
+	prs: list[dict[str, Any]] = []
+	prs_error = None
+	emit({'type': 'progress', 'message': 'gh pr status', 'pct': 0.7})
+	try:
+		pr_proc = subprocess.run(
+			[
+				'gh',
+				'pr',
+				'status',
+				'--json',
+				'title,state,url,updatedAt',
+			],
+			check=True,
+			capture_output=True,
+			text=True,
+		)
+		pr_data = json.loads(pr_proc.stdout)
+		if isinstance(pr_data, dict):
+			for bucket in ('createdBy', 'needsReview'):
+				items = pr_data.get(bucket)
+				if not isinstance(items, list):
+					continue
+				for p in items:
+					if not isinstance(p, dict):
+						continue
+					title = p.get('title') or ''
+					state = p.get('state') or ''
+					url = p.get('url') or ''
+					updated_at = p.get('updatedAt') or ''
+					prs.append(
+						{
+							'title': title,
+							'state': state,
+							'url': url,
+							'updatedAt': updated_at,
+							'date': updated_at,
+							'category': bucket,
+						},
+					)
+	except subprocess.CalledProcessError as e:
+		prs_error = (e.stderr or '').strip() or f'gh pr status failed (code={e.returncode})'
+	except Exception as e:
+		prs_error = str(e)
+
 	last_sync = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 	state = {
 		'last_sync': last_sync,
@@ -168,9 +212,12 @@ def main() -> int:
 		'accounts': accounts,
 		'notifications': notifications,
 		'notifications_error': notifications_error,
+		'prs': prs,
+		'prs_error': prs_error,
 		'stats': {
 			'notifications_count': len(notifications),
 			'notifications_unread': sum(1 for n in notifications if n.get('unread')),
+			'prs_count': len(prs),
 			'accounts_count': len(accounts),
 		},
 	}

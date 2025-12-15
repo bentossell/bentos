@@ -1,7 +1,10 @@
 ---
 name: gcal
 description: Google Calendar surface for syncing upcoming events and proposing/applying safe calendar actions.
-account: ben@bensbites.com
+accounts:
+  - ben.tossell@gmail.com
+  - ben@bensbites.com
+  - ben@factory.ai
 calendar_id: primary
 max_events: 50
 ---

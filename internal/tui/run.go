@@ -9,7 +9,7 @@ func Run(posDir string) error {
 	if err != nil {
 		return err
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = p.Run()
 	return err
 }

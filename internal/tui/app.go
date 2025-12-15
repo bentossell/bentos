@@ -45,19 +45,29 @@ type Model struct {
 	cmdInput textinput.Model
 	cmdMode  bool
 
+	width  int
+	height int
+
 	mode         uiMode
 	surfaceIdx   int
 	listItems    []listItem
 	listCursor   int
+	listOffset   int
 	listSelected map[string]bool
 
 	gmailAccounts   []string
 	gmailAccountIdx int
 
+	linearFilterIdx int
+
+	gcalAccounts   []string
+	gcalAccountIdx int
+
 	actionOptions []actionOption
 	actionCursor  int
 
 	detailItem    *listItem
+	detailSurface string
 	detailText    string
 	detailLoading bool
 
@@ -138,6 +148,7 @@ func New(posDir string) (Model, error) {
 		surfaceIdx:      0,
 		listItems:       nil,
 		listCursor:      0,
+		listOffset:      0,
 		listSelected:    map[string]bool{},
 	}, nil
 }
@@ -148,6 +159,20 @@ func (m Model) Init() tea.Cmd {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+	case tea.MouseMsg:
+		if m.mode == modeList {
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				return m, m.updateListKeys(tea.KeyMsg{Type: tea.KeyUp})
+			case tea.MouseWheelDown:
+				return m, m.updateListKeys(tea.KeyMsg{Type: tea.KeyDown})
+			}
+		}
+		return m, nil
 	case tea.KeyMsg:
 		switch {
 		case msg.String() == "ctrl+c" || msg.String() == "q":
@@ -388,9 +413,13 @@ func (m Model) View() string {
 
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Run"))
 	b.WriteString("\n")
+	runN := 12
+	if m.height > 0 {
+		runN = max(6, m.height/4)
+	}
 	start := 0
-	if len(m.runLines) > 20 {
-		start = len(m.runLines) - 20
+	if len(m.runLines) > runN {
+		start = len(m.runLines) - runN
 	}
 	for _, l := range m.runLines[start:] {
 		b.WriteString(l)
@@ -437,10 +466,12 @@ func (m *Model) prevSurface() {
 
 func (m *Model) resetSurfaceState() {
 	m.listCursor = 0
+	m.listOffset = 0
 	m.listSelected = map[string]bool{}
 	m.actionOptions = nil
 	m.actionCursor = 0
 	m.detailItem = nil
+	m.detailSurface = ""
 	m.detailText = ""
 	m.detailLoading = false
 	m.proposalsActive = false
@@ -486,7 +517,10 @@ func (m Model) renderHelp() string {
 		"  :               command palette (e.g. 'gmail sync', 'linear sync')",
 		"",
 		"Gmail tips:",
-		"  '[' / ']'       cycle account filter (All / per-account)",
+		"  '[' / ']' or '/' cycle account filter (All / per-account)",
+		"",
+		"Linear tips:",
+		"  f               cycle status filters (Focus/All/Done/Canceled)",
 	}
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render(strings.Join(lines, "\n"))
 }
@@ -503,10 +537,12 @@ func (m *Model) reloadListFromState() {
 		m.listItems = nil
 		return
 	}
+	m.listOffset = 0
 	m.listItems = items
 	if m.listCursor >= len(m.listItems) {
 		m.listCursor = max(0, len(m.listItems)-1)
 	}
+	m.ensureCursorVisible()
 }
 
 func (m *Model) loadListItems(surface string) ([]listItem, error) {
@@ -524,14 +560,14 @@ func (m *Model) loadListItems(surface string) ([]listItem, error) {
 			return nil, err
 		}
 		obj, _ := v.(map[string]any)
-		return listItemsFromLinear(obj), nil
+		return m.listItemsFromLinear(obj), nil
 	case "gcal":
 		v, err := m.readJSONRel("STATE/gcal.json")
 		if err != nil {
 			return nil, err
 		}
 		obj, _ := v.(map[string]any)
-		return listItemsFromGcal(obj), nil
+		return m.listItemsFromGcal(obj), nil
 	case "github":
 		v, err := m.readJSONRel("STATE/github.json")
 		if err != nil {
@@ -611,13 +647,18 @@ func (m *Model) listItemsFromGmail(obj map[string]any) []listItem {
 	return out
 }
 
-func listItemsFromLinear(obj map[string]any) []listItem {
+func (m *Model) listItemsFromLinear(obj map[string]any) []listItem {
 	if obj == nil {
 		return nil
 	}
 	issues := deriveMapList(obj["issues"])
+	filter := m.linearFilterName()
 	var out []listItem
 	for _, it := range issues {
+		status, _ := it["status"].(string)
+		if !linearStatusMatchesFilter(status, filter) {
+			continue
+		}
 		identifier, _ := it["identifier"].(string)
 		id, _ := it["id"].(string)
 		key := identifier
@@ -628,7 +669,6 @@ func listItemsFromLinear(obj map[string]any) []listItem {
 			continue
 		}
 		title, _ := it["title"].(string)
-		status, _ := it["status"].(string)
 		team, _ := it["team"].(string)
 		sub := status
 		if team != "" {
@@ -643,10 +683,20 @@ func listItemsFromLinear(obj map[string]any) []listItem {
 	return out
 }
 
-func listItemsFromGcal(obj map[string]any) []listItem {
+func (m *Model) listItemsFromGcal(obj map[string]any) []listItem {
 	if obj == nil {
 		return nil
 	}
+	accounts := deriveStringList(obj["accounts"])
+	m.gcalAccounts = append([]string{"All"}, accounts...)
+	if m.gcalAccountIdx < 0 || m.gcalAccountIdx >= len(m.gcalAccounts) {
+		m.gcalAccountIdx = 0
+	}
+	accountFilter := ""
+	if m.gcalAccountIdx > 0 && m.gcalAccountIdx < len(m.gcalAccounts) {
+		accountFilter = m.gcalAccounts[m.gcalAccountIdx]
+	}
+
 	events := deriveMapList(obj["events"])
 	var out []listItem
 	for _, it := range events {
@@ -654,21 +704,82 @@ func listItemsFromGcal(obj map[string]any) []listItem {
 		if id == "" {
 			continue
 		}
+		acct, _ := it["account"].(string)
+		if accountFilter != "" && acct != accountFilter {
+			continue
+		}
 		summary, _ := it["summary"].(string)
 		start, _ := it["start"].(string)
-		meta := ""
-		if start != "" {
-			meta = start
+		age := humanAgeFromISO(start)
+		meta := age
+		if acct != "" {
+			meta = acct + " · " + age
 		}
-		out = append(out, listItem{Key: id, Title: summary, Subtitle: meta, Meta: "", Raw: it})
+		key := id
+		if acct != "" {
+			key = acct + ":" + id
+		}
+		out = append(out, listItem{Key: key, Title: summary, Subtitle: start, Meta: meta, Raw: it})
 	}
 	return out
+}
+
+func (m *Model) linearFilterName() string {
+	filters := []string{"Focus", "All", "Done", "Canceled"}
+	if m.linearFilterIdx < 0 || m.linearFilterIdx >= len(filters) {
+		m.linearFilterIdx = 0
+	}
+	return filters[m.linearFilterIdx]
+}
+
+func linearStatusMatchesFilter(status string, filter string) bool {
+	s := strings.ToLower(status)
+	switch filter {
+	case "All":
+		return true
+	case "Done":
+		return strings.Contains(s, "done") || strings.Contains(s, "completed")
+	case "Canceled":
+		return strings.Contains(s, "canceled") || strings.Contains(s, "cancelled")
+	case "Focus":
+		// Intent: show items you likely need to act on.
+		return strings.Contains(s, "todo") || strings.Contains(s, "triage")
+	default:
+		return true
+	}
+}
+
+func listItemsFromLinear(obj map[string]any) []listItem {
+	return nil
+}
+
+func listItemsFromGcal(obj map[string]any) []listItem {
+	return nil
 }
 
 func listItemsFromGithub(obj map[string]any) []listItem {
 	if obj == nil {
 		return nil
 	}
+	prs := deriveMapList(obj["prs"])
+	if len(prs) > 0 {
+		var out []listItem
+		for _, it := range prs {
+			title, _ := it["title"].(string)
+			url, _ := it["url"].(string)
+			state, _ := it["state"].(string)
+			category, _ := it["category"].(string)
+			updated, _ := it["updatedAt"].(string)
+			key := url
+			if key == "" {
+				key = title
+			}
+			meta := strings.Trim(strings.Join([]string{category, state, humanAgeFromISO(updated)}, " · "), " ·")
+			out = append(out, listItem{Key: key, Title: title, Subtitle: meta, Meta: url, Raw: it})
+		}
+		return out
+	}
+
 	accounts := deriveMapList(obj["accounts"])
 	var out []listItem
 	for _, it := range accounts {
@@ -705,6 +816,16 @@ func (m Model) renderList() string {
 		}
 		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Account: " + acct + ")"))
 	}
+	if surface == "linear" {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Filter: " + m.linearFilterName() + ")"))
+	}
+	if surface == "gcal" {
+		acct := "All"
+		if m.gcalAccountIdx > 0 && m.gcalAccountIdx < len(m.gcalAccounts) {
+			acct = m.gcalAccounts[m.gcalAccountIdx]
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Account: " + acct + ")"))
+	}
 	b.WriteString("\n")
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(fmt.Sprintf("Selected: %d", m.selectedCount())))
 	b.WriteString("\n\n")
@@ -715,7 +836,32 @@ func (m Model) renderList() string {
 		return b.String()
 	}
 
-	for i, it := range m.listItems {
+	pageSize := m.listPageSize()
+	if pageSize <= 0 {
+		pageSize = 8
+	}
+	if m.listOffset < 0 {
+		m.listOffset = 0
+	}
+	if m.listOffset > max(0, len(m.listItems)-1) {
+		m.listOffset = max(0, len(m.listItems)-1)
+	}
+	end := m.listOffset + pageSize
+	if end > len(m.listItems) {
+		end = len(m.listItems)
+	}
+	maxTitle := 80
+	maxMeta := 120
+	if m.width > 0 {
+		w := m.width - 10
+		if w < 20 {
+			w = 20
+		}
+		maxTitle = w
+		maxMeta = w
+	}
+	for i := m.listOffset; i < end; i++ {
+		it := m.listItems[i]
 		cursor := "  "
 		if i == m.listCursor {
 			cursor = "> "
@@ -724,47 +870,100 @@ func (m Model) renderList() string {
 		if m.listSelected[it.Key] {
 			box = "[x]"
 		}
-		line := fmt.Sprintf("%s%s %s", cursor, box, it.Title)
+		line := fmt.Sprintf("%s%s %s", cursor, box, truncate(it.Title, maxTitle))
 		b.WriteString(line)
 		b.WriteString("\n")
-		if it.Subtitle != "" {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("    " + it.Subtitle))
-			b.WriteString("\n")
-		}
-		if it.Meta != "" {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("    " + it.Meta))
+		meta := strings.TrimSpace(strings.Trim(strings.Join([]string{it.Subtitle, it.Meta}, " · "), " ·"))
+		if meta != "" {
+			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("    " + truncate(meta, maxMeta)))
 			b.WriteString("\n")
 		}
 	}
+	if len(m.listItems) > end {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("…"))
+		b.WriteString("\n")
+	}
 
 	b.WriteString("\n")
-	b.WriteString(
-		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(
-			"Space select · Enter detail · a actions · : commands · ? help",
-		),
-	)
+	footer := "Space select · Enter detail · a actions · : commands · ? help"
+	if surface == "gmail" || surface == "gcal" {
+		footer = "Space select · Enter detail · a actions · [ ] or / account · : commands · ? help"
+	}
+	if surface == "linear" {
+		footer = "Space select · Enter detail · f filter · : commands · ? help"
+	}
+	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footer))
 	b.WriteString("\n")
 	return b.String()
 }
 
+func (m Model) listPageSize() int {
+	if m.height <= 0 {
+		return 8
+	}
+	// Rough layout budget:
+	// - 1 header line + 1 selected line + 1 blank + 1 footer + 1 blank
+	// - Run panel consumes ~1/4 of the remaining height (min 6)
+	runLines := max(6, m.height/4)
+	mainBudget := m.height - (2 + 2 + runLines)
+	if mainBudget < 6 {
+		mainBudget = 6
+	}
+	// Each item is ~2 lines.
+	rows := mainBudget / 2
+	if rows < 3 {
+		rows = 3
+	}
+	return rows
+}
+
 func (m Model) renderDetail() string {
 	var b strings.Builder
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Detail"))
+	surface := m.detailSurface
+	if surface == "" {
+		surface = m.activeSurface()
+	}
+	name := strings.ToUpper(surface[:1]) + surface[1:]
+	if surface == "gcal" {
+		name = "Calendar"
+	}
+	b.WriteString(lipgloss.NewStyle().Bold(true).Render(name))
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("  (Esc back)"))
 	b.WriteString("\n\n")
 
 	if m.detailItem != nil {
-		b.WriteString(lipgloss.NewStyle().Bold(true).Render(m.detailItem.Title))
-		b.WriteString("\n")
-		if m.detailItem.Subtitle != "" {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(m.detailItem.Subtitle))
+		if surface == "gmail" {
+			from, _ := m.detailItem.Raw["from"].(string)
+			subject := m.detailItem.Title
+			date, _ := m.detailItem.Raw["date"].(string)
+			acct, _ := m.detailItem.Raw["account"].(string)
+
+			b.WriteString(lipgloss.NewStyle().Bold(true).Render(subject))
+			b.WriteString("\n")
+			b.WriteString(renderLabelValue("From", from))
+			b.WriteString("\n")
+			if acct != "" {
+				b.WriteString(renderLabelValue("Account", acct))
+				b.WriteString("\n")
+			}
+			if date != "" {
+				b.WriteString(renderLabelValue("Date", date))
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
+		} else {
+			b.WriteString(lipgloss.NewStyle().Bold(true).Render(m.detailItem.Title))
+			b.WriteString("\n")
+			if m.detailItem.Subtitle != "" {
+				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(m.detailItem.Subtitle))
+				b.WriteString("\n")
+			}
+			if m.detailItem.Meta != "" {
+				b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(m.detailItem.Meta))
+				b.WriteString("\n")
+			}
 			b.WriteString("\n")
 		}
-		if m.detailItem.Meta != "" {
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(m.detailItem.Meta))
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
 	}
 
 	if m.detailLoading {
@@ -774,7 +973,18 @@ func (m Model) renderDetail() string {
 	}
 
 	if m.detailText != "" {
-		b.WriteString(m.detailText)
+		text := m.detailText
+		if surface == "gmail" {
+			text = stripGmailThreadHeaders(text)
+		}
+		if m.width > 0 {
+			w := m.width - 2
+			if w < 20 {
+				w = 20
+			}
+			text = hardWrap(text, w)
+		}
+		b.WriteString(text)
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -812,11 +1022,13 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 		if m.listCursor > 0 {
 			m.listCursor--
 		}
+		m.ensureCursorVisible()
 		return nil
 	case "down", "j":
 		if m.listCursor < len(m.listItems)-1 {
 			m.listCursor++
 		}
+		m.ensureCursorVisible()
 		return nil
 	case " ", "x":
 		if len(m.listItems) == 0 {
@@ -833,6 +1045,13 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 	case "u":
 		m.listSelected = map[string]bool{}
 		return nil
+	case "f":
+		if surface == "linear" {
+			m.linearFilterIdx = (m.linearFilterIdx + 1) % 4
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+		}
+		return nil
 	case "[":
 		if surface == "gmail" && len(m.gmailAccounts) > 0 {
 			m.gmailAccountIdx--
@@ -840,12 +1059,42 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 				m.gmailAccountIdx = len(m.gmailAccounts) - 1
 			}
 			m.reloadListFromState()
+			m.ensureCursorVisible()
+		}
+		if surface == "gcal" && len(m.gcalAccounts) > 0 {
+			m.gcalAccountIdx--
+			if m.gcalAccountIdx < 0 {
+				m.gcalAccountIdx = len(m.gcalAccounts) - 1
+			}
+			m.reloadListFromState()
+			m.ensureCursorVisible()
 		}
 		return nil
 	case "]":
 		if surface == "gmail" && len(m.gmailAccounts) > 0 {
 			m.gmailAccountIdx = (m.gmailAccountIdx + 1) % len(m.gmailAccounts)
 			m.reloadListFromState()
+			m.ensureCursorVisible()
+		}
+		if surface == "gcal" && len(m.gcalAccounts) > 0 {
+			m.gcalAccountIdx = (m.gcalAccountIdx + 1) % len(m.gcalAccounts)
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+		}
+		return nil
+	case "/":
+		// Quick UX: allow '/' to cycle the Gmail/Calendar account filter.
+		if surface == "gmail" && len(m.gmailAccounts) > 0 {
+			m.gmailAccountIdx = (m.gmailAccountIdx + 1) % len(m.gmailAccounts)
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+			return nil
+		}
+		if surface == "gcal" && len(m.gcalAccounts) > 0 {
+			m.gcalAccountIdx = (m.gcalAccountIdx + 1) % len(m.gcalAccounts)
+			m.reloadListFromState()
+			m.ensureCursorVisible()
+			return nil
 		}
 		return nil
 	case "enter":
@@ -855,6 +1104,7 @@ func (m *Model) updateListKeys(msg tea.KeyMsg) tea.Cmd {
 		it := m.listItems[m.listCursor]
 		m.mode = modeDetail
 		m.detailItem = &it
+		m.detailSurface = surface
 		m.detailText = ""
 		m.detailLoading = false
 		m.lastErr = ""
@@ -1034,6 +1284,21 @@ func (m Model) selectedCount() int {
 	return c
 }
 
+func (m *Model) ensureCursorVisible() {
+	pageSize := m.listPageSize()
+	if pageSize <= 0 {
+		pageSize = 8
+	}
+	if m.listCursor < m.listOffset {
+		m.listOffset = m.listCursor
+		return
+	}
+	if m.listCursor >= m.listOffset+pageSize {
+		m.listOffset = m.listCursor - pageSize + 1
+		return
+	}
+}
+
 func deriveMapList(v any) []map[string]any {
 	arr, ok := v.([]any)
 	if !ok {
@@ -1085,6 +1350,60 @@ func prettyJSON(v any) string {
 		return fmt.Sprintf("%v", v)
 	}
 	return string(b)
+}
+
+func renderLabelValue(label string, value string) string {
+	labelStyle := lipgloss.NewStyle().Bold(true)
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	return labelStyle.Render(label+":") + " " + valueStyle.Render(value)
+}
+
+func stripGmailThreadHeaders(text string) string {
+	lines := strings.Split(text, "\n")
+	// Drop a leading header block emitted by gmcli thread.
+	// We keep everything after the first blank line that follows known header fields.
+	seen := false
+	start := 0
+	for i, line := range lines {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, "Message-ID") || strings.HasPrefix(l, "From:") || strings.HasPrefix(l, "To:") || strings.HasPrefix(l, "Date:") || strings.HasPrefix(l, "Subject:") {
+			seen = true
+			continue
+		}
+		if seen && l == "" {
+			start = i + 1
+			break
+		}
+		if i > 30 {
+			break
+		}
+	}
+	if start > 0 && start < len(lines) {
+		return strings.TrimSpace(strings.Join(lines[start:], "\n"))
+	}
+	return strings.TrimSpace(text)
+}
+
+func hardWrap(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+	var out []string
+	for _, line := range strings.Split(text, "\n") {
+		r := []rune(line)
+		if len(r) <= width {
+			out = append(out, line)
+			continue
+		}
+		for len(r) > width {
+			out = append(out, string(r[:width]))
+			r = r[width:]
+		}
+		if len(r) > 0 {
+			out = append(out, string(r))
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func truncate(s string, n int) string {
