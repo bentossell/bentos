@@ -52,9 +52,15 @@ def main() -> int:
 
 	skill_md = os.path.join(pos_dir, 'skills', 'gmail', 'SKILL.md')
 	prefs = parse_frontmatter(skill_md)
-	account = prefs.get('account') or ''
-	if not account:
-		emit({'type': 'error', 'message': 'gmail account not configured in SKILL.md frontmatter'})
+	accounts = prefs.get('accounts') or []
+	if not isinstance(accounts, list):
+		accounts = []
+	if not accounts:
+		fallback = prefs.get('account') or ''
+		if fallback:
+			accounts = [fallback]
+	if not accounts:
+		emit({'type': 'error', 'message': 'gmail accounts not configured in SKILL.md frontmatter'})
 		return 1
 
 	try:
@@ -77,13 +83,17 @@ def main() -> int:
 		op = action.get('op')
 		entities = action.get('entities') or []
 		thread_id = None
+		account = None
 		if isinstance(entities, list) and entities:
 			e0 = entities[0]
 			if isinstance(e0, dict):
 				thread_id = e0.get('id')
+				account = e0.get('account')
 		if not thread_id:
 			results.append({'ok': False, 'error': 'missing thread id', 'action': action.get('id')})
 			continue
+		if not account or not isinstance(account, str):
+			account = accounts[0]
 
 		cmd: list[str] | None = None
 		if op == 'star':
@@ -98,7 +108,7 @@ def main() -> int:
 
 		try:
 			subprocess.run(cmd, check=True, capture_output=True, text=True)
-			results.append({'ok': True, 'action': action.get('id'), 'op': op, 'thread_id': thread_id})
+			results.append({'ok': True, 'action': action.get('id'), 'op': op, 'thread_id': thread_id, 'account': account})
 		except FileNotFoundError:
 			emit({'type': 'error', 'message': 'gmcli not found in PATH'})
 			return 1
@@ -109,6 +119,7 @@ def main() -> int:
 					'action': action.get('id'),
 					'op': op,
 					'thread_id': thread_id,
+					'account': account,
 					'error': (e.stderr or '').strip() or 'gmcli failed',
 					'code': e.returncode,
 				},

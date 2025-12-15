@@ -78,6 +78,7 @@ def main() -> int:
 		thread_id = str(t.get('id') or '')
 		subject = str(t.get('subject') or '')
 		from_ = str(t.get('from') or '')
+		account = str(t.get('account') or '')
 		if not thread_id:
 			continue
 
@@ -92,7 +93,7 @@ def main() -> int:
 					'id': f'star_{thread_id}',
 					'op': 'star',
 					'surface': 'gmail',
-					'entities': [{'type': 'email_thread', 'id': thread_id}],
+					'entities': [{'type': 'email_thread', 'id': thread_id, 'account': account}],
 					'summary': f'Star: {subject[:80]}',
 					'reasoning': f'From VIP domain: {from_domain}',
 					'ts': now_iso(),
@@ -106,7 +107,7 @@ def main() -> int:
 					'id': f'archive_{thread_id}',
 					'op': 'archive',
 					'surface': 'gmail',
-					'entities': [{'type': 'email_thread', 'id': thread_id}],
+					'entities': [{'type': 'email_thread', 'id': thread_id, 'account': account}],
 					'summary': f'Archive: {subject[:80]}',
 					'reasoning': 'Newsletter-like subject',
 					'ts': now_iso(),

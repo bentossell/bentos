@@ -20,6 +20,16 @@ widgets:
     columns: ["identifier", "title", "status", "age"]
     max_rows: 8
 
+  - id: github_accounts
+    title: GitHub — Accounts
+    type: table
+    source: state
+    surface: github
+    path: STATE/github.json
+    query: "active == true"
+    columns: ["login", "scopes"]
+    max_rows: 8
+
   - id: today_calendar
     title: Calendar — Today
     type: list
@@ -43,4 +53,4 @@ widgets:
 # Home
 
 - `:` open command input
-- Suggested commands: `gmail sync`, `gmail propose`, `gmail apply`
+- Suggested commands: `gmail sync`, `gmail propose`, `gmail apply`, `linear sync`, `github sync`

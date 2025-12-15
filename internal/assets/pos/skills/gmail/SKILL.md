@@ -1,7 +1,10 @@
 ---
 name: gmail
 description: Gmail surface for syncing inbox state and proposing/applying safe triage actions.
-account: ben@bensbites.com
+accounts:
+  - ben.tossell@gmail.com
+  - ben@bensbites.com
+  - ben@factory.ai
 max_threads: 50
 vip_domains:
   - factory.ai

@@ -181,43 +181,65 @@ def main() -> int:
 
 	skill_md = os.path.join(pos_dir, 'skills', 'gmail', 'SKILL.md')
 	prefs = parse_frontmatter(skill_md)
-	account = prefs.get('account') or ''
+	accounts = prefs.get('accounts') or []
 	max_threads = int(prefs.get('max_threads') or 50)
-	if not account:
-		emit({'type': 'error', 'message': 'gmail account not configured in SKILL.md frontmatter'})
+	if not isinstance(accounts, list):
+		accounts = []
+	if not accounts:
+		account = prefs.get('account') or ''
+		if account:
+			accounts = [account]
+	if not accounts:
+		emit({'type': 'error', 'message': 'gmail accounts not configured in SKILL.md frontmatter'})
 		return 1
 
 	query = 'in:inbox is:unread'
-	emit({'type': 'progress', 'message': f'gmcli search {account} "{query}"', 'pct': 0.1})
+	all_threads: list[dict[str, Any]] = []
+	per_account: dict[str, int] = {}
 
-	try:
-		proc = subprocess.run(
-			['gmcli', account, 'search', query, '--max', str(max_threads)],
-			check=True,
-			capture_output=True,
-			text=True,
-		)
-	except FileNotFoundError:
-		emit({'type': 'error', 'message': 'gmcli not found in PATH'})
-		return 1
-	except subprocess.CalledProcessError as e:
-		emit(
-			{
-				'type': 'error',
-				'message': 'gmcli search failed',
-				'details': {'code': e.returncode, 'stderr': (e.stderr or '').strip()},
-			},
-		)
-		return 1
+	for idx, account in enumerate(accounts):
+		if not isinstance(account, str) or not account:
+			continue
+		pct = 0.1 + 0.7 * (idx / max(len(accounts), 1))
+		emit({'type': 'progress', 'message': f'gmcli search {account} "{query}"', 'pct': pct})
+		try:
+			proc = subprocess.run(
+				['gmcli', account, 'search', query, '--max', str(max_threads)],
+				check=True,
+				capture_output=True,
+				text=True,
+			)
+		except FileNotFoundError:
+			emit({'type': 'error', 'message': 'gmcli not found in PATH'})
+			return 1
+		except subprocess.CalledProcessError as e:
+			emit(
+				{
+					'type': 'error',
+					'message': 'gmcli search failed',
+					'details': {
+						'account': account,
+						'code': e.returncode,
+						'stderr': (e.stderr or '').strip(),
+					},
+				},
+			)
+			return 1
 
-	threads = parse_search_output(proc.stdout)
+		threads = parse_search_output(proc.stdout)
+		for t in threads:
+			t['account'] = account
+		all_threads.extend(threads)
+		per_account[account] = len(threads)
 	last_sync = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 	state = {
 		'last_sync': last_sync,
-		'threads': threads,
+		'accounts': accounts,
+		'threads': all_threads,
 		'stats': {
-			'unread': len(threads),
+			'unread': len(all_threads),
 			'inbox_total': None,
+			'per_account_unread': per_account,
 		},
 	}
 
@@ -228,7 +250,7 @@ def main() -> int:
 		f.write('\n')
 
 	emit({'type': 'artifact', 'path': 'STATE/gmail.json', 'description': 'Updated gmail index state'})
-	emit({'type': 'result', 'ok': True, 'data': {'threads': len(threads), 'account': account}})
+	emit({'type': 'result', 'ok': True, 'data': {'threads': len(all_threads), 'accounts': accounts}})
 	return 0
 
 
